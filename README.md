@@ -1,12 +1,5 @@
 # Steam 统译 v2.0 (Steam Unify)
 
-[![GitHub](https://img.shields.io/badge/GitHub-moutou232%2Fsteam--unify-181717?logo=github)](https://github.com/moutou232/steam-unify)
-[![Release](https://img.shields.io/badge/release-v2.0.0-blue)](https://github.com/moutou232/steam-unify/releases/tag/v2.0.0)
-
-> 下载最新 Windows 便携版：[Releases v2.0.0](https://github.com/moutou232/steam-unify/releases/tag/v2.0.0)
->
-> v1 程序与 v1 发布包保留在 [v1.0.0](https://github.com/moutou232/steam-unify/releases/tag/v1.0.0)。
-
 把 Steam 库游戏名翻译成简体中文，并按标签/类型/社区来源整理为最多 3 个分类。支持手动修改、独立应用名称或分类、备份导入导出，重启 Steam 后保留。
 
 > 只读写本机 Steam 本地缓存和本程序数据；不读取、不保存、不上传账号密码、令牌或登录凭据。

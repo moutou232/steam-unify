@@ -38,6 +38,14 @@ def _norm_path(value: str | None) -> Path | None:
     return p
 
 
+def _reg_value_hklm(key: str, name: str) -> Any:
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except OSError:
+        return None
+
+
 def detect_root(override: str | Path | None = None) -> Path:
     if override:
         root = Path(override).expanduser()
@@ -48,6 +56,14 @@ def detect_root(override: str | Path | None = None) -> Path:
     reg = _norm_path(_reg_value(r"Software\Valve\Steam", "SteamPath"))
     if reg:
         candidates.append(reg)
+    steam_exe = _norm_path(_reg_value(r"Software\Valve\Steam", "SteamExe"))
+    if steam_exe:
+        candidates.append(steam_exe.parent)
+    install = _norm_path(_reg_value_hklm(
+        r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"
+    ))
+    if install:
+        candidates.append(install)
     candidates += [
         Path(r"C:\Program Files (x86)\Steam"),
         Path(r"C:\Program Files\Steam"),
@@ -57,7 +73,11 @@ def detect_root(override: str | Path | None = None) -> Path:
     ]
     for c in candidates:
         try:
-            if (c / "userdata").is_dir() and (c / "appcache").is_dir():
+            if not (c / "userdata").is_dir():
+                continue
+            # appcache may be temporarily absent while Steam is starting or
+            # shutting down; steamapps is enough to identify the root.
+            if (c / "appcache").is_dir() or (c / "steamapps").is_dir():
                 return c
         except OSError:
             continue

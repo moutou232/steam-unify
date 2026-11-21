@@ -11,6 +11,7 @@ All code that touches names must go through :class:`AppInfoCache`.
 
 from __future__ import annotations
 
+import shutil
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -60,11 +61,13 @@ class AppInfoCache:
                 return cls(CacheKind.MISSING)
             time.sleep(0.25)
 
-    def require(self) -> "AppInfoCache":
+    def require(self, root: Path | None = None) -> "AppInfoCache":
         if self.kind == CacheKind.MISSING:
+            where = f"\nSteam 根目录：{root}" if root else ""
             raise CacheError(
                 "未找到 Steam appinfo 缓存（appcache/appinfo.vdf 或 "
                 "appcache/appinfo/appinfo_*.vdf）。\n"
+                f"{where}\n"
                 "请先启动一次 Steam 让缓存生成，或在设置中检查 Steam 目录。"
             )
         return self
@@ -85,6 +88,63 @@ class AppInfoCache:
         if self.kind == CacheKind.MONOLITHIC:
             return "单文件 appinfo.vdf"
         return "未找到 appinfo 缓存"
+
+
+@dataclass
+class CacheSnapshot:
+    """Cache data loaded before Steam is closed.
+
+    Steam can remove appcache/appinfo while exiting.  Keep the parsed cache
+    and its paths so apply/undo can write after shutdown without re-detecting.
+    """
+
+    info: AppInfoCache
+    shards: ShardSet | None = None
+    app_info: appinfo.AppInfo | None = None
+    shard_count: int = 0
+
+    @classmethod
+    def capture(cls, info: AppInfoCache) -> "CacheSnapshot":
+        snapshot = cls(info)
+        if info.kind == CacheKind.SHARDS:
+            snapshot.shards = info.load_shards()
+            snapshot.shard_count = len(list(info.shard_dir.glob("appinfo_*.vdf"))) if info.shard_dir else 0
+        elif info.kind == CacheKind.MONOLITHIC:
+            snapshot.app_info = info.load_appinfo()
+        return snapshot
+
+    def restore_if_missing(self, env: steamenv.SteamEnv, backup_dir: Path) -> None:
+        """Restore only appinfo files from the pre-shutdown backup if needed."""
+        backup_dir = Path(backup_dir)
+        if self.info.kind == CacheKind.SHARDS:
+            current = env.shard_dir
+            files = list(current.glob("appinfo_*.vdf")) if current.is_dir() else []
+            if len(files) >= self.shard_count and files:
+                return
+            source = backup_dir / "appinfo"
+            if not source.is_dir():
+                raise CacheError(
+                    "Steam 退出后 appinfo 分片缓存消失，但备份中没有 appinfo 目录；"
+                    "请重新启动 Steam 后再试。"
+                )
+            if current.exists():
+                shutil.rmtree(current)
+            shutil.copytree(source, current)
+            return
+        if self.info.kind == CacheKind.MONOLITHIC:
+            if env.appinfo.is_file():
+                return
+            for candidate in (backup_dir / "appcache" / "appinfo.vdf",
+                              backup_dir / "steamapps" / "appinfo.vdf",
+                              backup_dir / "appinfo.vdf"):
+                if candidate.is_file():
+                    env.appinfo.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(candidate, env.appinfo)
+                    return
+            raise CacheError(
+                "Steam 退出后 appinfo.vdf 消失，但备份中没有对应文件；"
+                "请重新启动 Steam 后再试。"
+            )
 
 
 def detect_for_context(

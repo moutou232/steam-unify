@@ -41,25 +41,37 @@ def undo_all(
     if mode not in ("names", "categories", "both"):
         raise ValueError(f"unknown undo mode: {mode}")
     result = UndoResult()
-    cache_info = cache.AppInfoCache.detect(env).require()
-    apply.preflight_writable(env)
+    need_appinfo = mode != "categories"
+    cache_info = cache.AppInfoCache.detect(env)
+    if need_appinfo:
+        cache_info.require(env.root)
+    snapshot = cache.CacheSnapshot.capture(cache_info) if need_appinfo else None
+    apply.preflight_writable(env, include_appinfo=need_appinfo)
     was_running = steamenv.steam_running()
-    if was_running:
-        if log:
-            log("Steam 正在运行，正在自动关闭 ...")
-        steamenv.close_steam(env, log=log)
-        time.sleep(2.0)
-        cache_info = cache.AppInfoCache.detect(env, wait=3.0).require()
-
     result.backup = apply.backup(env, state, steamenv.installed_apps(env.root))
     if log:
         log(f"复原前已备份到 {result.backup}")
+    if was_running:
+        if log:
+            log("Steam 正在运行，正在自动关闭 ...")
+        try:
+            steamenv.close_steam(env, log=log)
+            time.sleep(2.0)
+            if snapshot is not None:
+                snapshot.restore_if_missing(env, result.backup)
+        except Exception:
+            if not steamenv.steam_running():
+                try:
+                    steamenv.start_steam(env)
+                except Exception:
+                    pass
+            raise
 
     try:
         appids = sorted(int(a) for a in state.apps.keys())
         total = max(1, len(appids))
-        ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
-        ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
+        ss = snapshot.shards if snapshot else None
+        ai = snapshot.app_info if snapshot else None
         changed_appinfo = False
 
         for index, appid in enumerate(appids, 1):
@@ -126,6 +138,7 @@ def undo_all(
                     data = ai.build()
                     target = cache_info.appinfo_path
                     assert target is not None
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     tmp = target.with_name(target.name + ".tmp")
                     with open(tmp, "wb") as f:
                         f.write(data)

@@ -61,13 +61,14 @@ def _probe_writable(directory: Path) -> None:
             pass
 
 
-def preflight_writable(env: steamenv.SteamEnv) -> None:
+def preflight_writable(env: steamenv.SteamEnv, *, include_appinfo: bool = True) -> None:
     """Fail before closing Steam if any target directory is not writable."""
     targets: list[Path] = []
-    if env.has_shards:
-        targets.append(env.shard_dir)
-    else:
-        targets.append(env.appinfo.parent)
+    if include_appinfo:
+        if env.has_shards:
+            targets.append(env.shard_dir)
+        else:
+            targets.append(env.appinfo.parent)
     targets += [env.cloudstorage]
     for info in steamenv.installed_apps(env.root).values():
         acf = info.get("acf")
@@ -95,6 +96,26 @@ def _retry_write(func, *args, attempts: int = 4, delay: float = 0.8):
                 time.sleep(delay * (i + 1))
     assert last is not None
     raise last
+
+
+def _verify_cache_written(
+    snapshot: cache.CacheSnapshot,
+    changed_ids: list[int],
+    names: dict[int, str],
+) -> None:
+    if not changed_ids:
+        return
+    if snapshot.info.kind == cache.CacheKind.SHARDS:
+        fresh = ShardSet.load(snapshot.info.shard_dir)  # type: ignore[arg-type]
+        bad = [appid for appid in changed_ids if (fresh.get_name(appid) or "") != names[appid]]
+    else:
+        fresh = appinfo.AppInfo.load(snapshot.info.appinfo_path)  # type: ignore[arg-type]
+        bad = [appid for appid in changed_ids if (fresh.get_name(appid) or "") != names[appid]]
+    if bad:
+        raise ApplyError(
+            "appinfo 写入后校验失败，Steam 可能正在覆盖缓存；"
+            f"未生效条目：{', '.join(str(x) for x in bad[:8])}"
+        )
 
 
 def _set_readonly(path: Path, readonly: bool) -> None:
@@ -254,21 +275,36 @@ def apply_changes(
     if mode not in APPLY_MODES:
         raise ValueError(f"unknown apply mode: {mode}")
     result = ApplyResult()
-    cache_info = cache.AppInfoCache.detect(env).require()
-    preflight_writable(env)
+    need_appinfo = mode != "categories"
+    cache_info = cache.AppInfoCache.detect(env)
+    if need_appinfo:
+        cache_info.require(env.root)
+    snapshot = cache.CacheSnapshot.capture(cache_info) if need_appinfo else None
+    preflight_writable(env, include_appinfo=need_appinfo)
     was_running = steamenv.steam_running()
+    # Back up before closing Steam.  New Steam clients may remove the shard
+    # directory on exit, so a post-shutdown backup can miss the cache.
+    result.backup = backup(env, state, steamenv.installed_apps(env.root))
     if was_running:
         if log:
             log("Steam 正在运行，正在自动关闭 ...")
-        steamenv.close_steam(env, log=log)
-        # Give Steam a moment to release its handles on cloudstorage files.
-        time.sleep(2.0)
-        cache_info = cache.AppInfoCache.detect(env, wait=3.0).require()
-    result.backup = backup(env, state, steamenv.installed_apps(env.root))
+        try:
+            steamenv.close_steam(env, log=log)
+            # Give Steam a moment to release its handles on cloudstorage files.
+            time.sleep(2.0)
+            if snapshot is not None:
+                snapshot.restore_if_missing(env, result.backup)
+        except Exception:
+            if not steamenv.steam_running():
+                try:
+                    steamenv.start_steam(env)
+                except Exception:
+                    pass
+            raise
     if log:
         log(f"已备份到 {result.backup}")
     if progress:
-        progress(f"已备份，正在写入 {cache_info.describe()} ...")
+        progress(f"已备份，正在写入 {cache_info.describe() if cache_info.exists else '分类收藏集'} ...")
 
     # Make sure appinfo is writable (we may have locked it previously).
     if cache_info.kind == cache.CacheKind.MONOLITHIC and cache_info.appinfo_path and is_readonly(cache_info.appinfo_path):
@@ -280,8 +316,11 @@ def apply_changes(
         else:
             planned, names = _plan_names(state, games, selected)
         changed_ids: list[int] = []
-        if cache_info.kind == cache.CacheKind.SHARDS:
-            ss = cache_info.load_shards()
+        if mode == "categories":
+            pass
+        elif cache_info.kind == cache.CacheKind.SHARDS:
+            assert snapshot is not None and snapshot.shards is not None
+            ss = snapshot.shards
             for g in planned:
                 zh = names[g.appid]
                 try:
@@ -299,10 +338,12 @@ def apply_changes(
                     result.warnings.append(f"{g.appid} {g.name}: {exc}")
             if changed_ids:
                 _retry_write(ss.save)
+                _verify_cache_written(snapshot, changed_ids, names)
             if lock_appinfo:
                 result.warnings.append("分片 appinfo 模式不支持只读锁定，已跳过")
         else:
-            ai = cache_info.load_appinfo()
+            assert snapshot is not None and snapshot.app_info is not None
+            ai = snapshot.app_info
             for g in planned:
                 zh = names[g.appid]
                 try:
@@ -320,9 +361,10 @@ def apply_changes(
                     result.warnings.append(f"{g.appid} {g.name}: {exc}")
             if changed_ids:
                 data = ai.build()
-                appinfo_path = cache_info.appinfo_path
+                appinfo_path = snapshot.info.appinfo_path
                 assert appinfo_path is not None
                 tmp = appinfo_path.with_name(appinfo_path.name + ".tmp")
+                appinfo_path.parent.mkdir(parents=True, exist_ok=True)
 
                 def write_appinfo() -> None:
                     with open(tmp, "wb") as f:
@@ -332,6 +374,7 @@ def apply_changes(
                     os.replace(tmp, appinfo_path)
 
                 _retry_write(write_appinfo)
+                _verify_cache_written(snapshot, changed_ids, names)
                 if lock_appinfo:
                     _set_readonly(appinfo_path, True)
 
@@ -415,7 +458,10 @@ def verify(
         time.sleep(wait)
     if not steamenv.steam_running():
         result.warnings.append("校验时 Steam 未运行")
-    cache_info = cache.AppInfoCache.detect(env, wait=1.0).require()
+    cache_info = cache.AppInfoCache.detect(env, wait=15.0)
+    if cache_info.kind == cache.CacheKind.MISSING:
+        result.warnings.append("校验时未找到 appinfo 缓存，稍后重新扫描即可")
+        return result
     ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
     ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
     if mode in ("both", "names"):
