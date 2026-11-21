@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import appinfo, descriptions, paths, steamenv
+from . import appinfo, cache, descriptions, paths, steamenv
 from .appinfo_shards import ShardSet
 
 
@@ -80,6 +80,7 @@ class GameInfo:
     description: str = ""
     description_source: str = ""
     original_name: str = ""
+    category_evidence: list = field(default_factory=list)
     installed: bool = False
     owned: bool = False
     acf: Path | None = None
@@ -139,13 +140,14 @@ def scan(
 
     shards = None
     ai = None
-    if env.has_shards:
-        shards = ShardSet.load(env.shard_dir)
+    app_cache = cache.AppInfoCache.detect(env)
+    if app_cache.kind == cache.CacheKind.SHARDS:
+        shards = app_cache.load_shards()
         if warnings is not None:
             warnings.extend(shards.warnings)
         all_ids = set(shards.appids)
-    elif env.appinfo.is_file():
-        ai = appinfo.AppInfo.load(env.appinfo)
+    elif app_cache.kind == cache.CacheKind.MONOLITHIC:
+        ai = app_cache.load_appinfo()
         all_ids = set(ai._by_appid)
     else:
         return []

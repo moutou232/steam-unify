@@ -1,0 +1,35 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Runtime data (user-specific)
+data/state.json
+data/state.v1.bak
+data/state.v2.bak
+data/settings.json
+data/provider_cache.json
+data/original_names*.json
+backups/
+release/
+logs/
+*.log
+
+# Build artifacts
+build/
+build-*/
+dist/
+*.spec
+*.exe
+*.zip
+*.msi
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local test data
+tests/fixtures/appinfo.vdf

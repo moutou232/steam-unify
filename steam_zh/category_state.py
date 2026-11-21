@@ -147,6 +147,33 @@ def migrate(st: Any) -> bool:
                 locked=bool(rec.get("category_locked")),
             )
         data["version"] = 2
+        version = 2
+        changed = True
+    if version < 3:
+        state_path = paths.data_dir() / "state.json"
+        if state_path.is_file():
+            backup = paths.data_dir() / "state.v2.bak"
+            if not backup.exists():
+                try:
+                    shutil.copy2(state_path, backup)
+                except OSError:
+                    pass
+        for rec in data.get("apps", {}).values():
+            if not isinstance(rec, dict):
+                continue
+            rec.setdefault("name_candidates", [])
+            rec.setdefault("name_provider_errors", [])
+            rec.setdefault("orig_unknown", False)
+            rec.setdefault("orig_source", "")
+            rec.setdefault("orig_verified", False)
+            rec.setdefault("cache_entry", False)
+            rec.setdefault("skipped", False)
+            rec.setdefault("name_selected_source", "")
+            rec.setdefault("name_confidence", 0.0)
+            rec.setdefault("name_selected_by", "")
+            rec.setdefault("category_sources", {})
+            rec.setdefault("category_confidence", {})
+        data["version"] = 3
         changed = True
     else:
         # Repair malformed / oversized records without discarding the version.

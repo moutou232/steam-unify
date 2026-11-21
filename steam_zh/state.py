@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,8 @@ from . import paths
 DATA_DIR = paths.data_dir()
 STATE_PATH = DATA_DIR / "state.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
+
+APP_VERSION = "2.0"
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -26,6 +29,18 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "restart_steam": True,
     "lock_appinfo": False,
     "backup_keep": 10,
+    "window_mode": "maximized",
+    "window_geometry": "",
+    "source_priority": [
+        "steam_official",
+        "dictionary",
+        "steam_store",
+        "xiaoheihe",
+        "3dm",
+        "steam_china",
+        "steamdb",
+        "mymemory",
+    ],
 }
 
 
@@ -50,12 +65,49 @@ def _atomic_write_json(path: Path, data: Any) -> None:
 class State:
     def __init__(self, data: dict[str, Any] | None = None):
         self.data = data if isinstance(data, dict) else {}
-        self.data.setdefault("version", 2)
+        self.data.setdefault("version", 3)
         self.data.setdefault("apps", {})
         self.data.setdefault("collections", {})
+        self.data.setdefault("collection_ids", {})
+        self.data.setdefault("collection_owned", {})
         self.data.setdefault("settings", {})
+        self._normalize_collections()
         for key, value in DEFAULT_SETTINGS.items():
             self.data["settings"].setdefault(key, value)
+
+    def _normalize_collections(self) -> None:
+        cols = self.collections
+        ids = self.data["collection_ids"]
+        owned = self.data["collection_owned"]
+        if not isinstance(cols, dict):
+            cols = self.data["collections"] = {}
+        if not isinstance(ids, dict):
+            ids = self.data["collection_ids"] = {}
+        if not isinstance(owned, dict):
+            owned = self.data["collection_owned"] = {}
+        legacy = not ids and not owned
+        for category, cid in list(cols.items()):
+            if not cid:
+                continue
+            category = str(category)
+            cid = str(cid)
+            bucket = ids.setdefault(category, [])
+            if cid not in bucket:
+                bucket.append(cid)
+            if legacy:
+                owned_bucket = owned.setdefault(category, [])
+                if cid not in owned_bucket:
+                    owned_bucket.append(cid)
+        for category, values in list(ids.items()):
+            cleaned = [str(cid) for cid in values if cid]
+            ids[str(category)] = cleaned
+            if cleaned and not cols.get(category):
+                cols[str(category)] = cleaned[0]
+        for category, values in list(owned.items()):
+            owned[str(category)] = [str(cid) for cid in values if cid]
+        self.data["collections"] = cols
+        self.data["collection_ids"] = ids
+        self.data["collection_owned"] = owned
 
     @classmethod
     def load(cls) -> "State":
@@ -73,6 +125,14 @@ class State:
         return self.data["collections"]
 
     @property
+    def collection_ids(self) -> dict[str, list[str]]:
+        return self.data["collection_ids"]
+
+    @property
+    def collection_owned(self) -> dict[str, list[str]]:
+        return self.data["collection_owned"]
+
+    @property
     def settings(self) -> dict[str, Any]:
         return self.data["settings"]
 
@@ -84,45 +144,68 @@ class State:
         rec.update(values)
         return rec
 
+    def is_skipped(self, appid: int) -> bool:
+        return bool(self.apps.get(str(appid), {}).get("skipped"))
+
     def merge_games(self, games) -> None:
         for g in games:
             rec = self.get_app(g.appid)
-            rec.setdefault("orig_name", g.name)
             rec.setdefault("zh_name", "")
             rec.setdefault("source", "")
             rec.setdefault("categories", [])
             rec.setdefault("primary_category", "")
             rec.setdefault("category", "")
             rec.setdefault("category_source", "")
+            rec.setdefault("category_sources", {})
+            rec.setdefault("category_confidence", {})
+            rec.setdefault("name_candidates", [])
+            rec.setdefault("name_provider_errors", [])
+            rec.setdefault("name_selected_source", "")
+            rec.setdefault("name_confidence", 0.0)
+            rec.setdefault("name_selected_by", "")
             rec.setdefault("category_locked", False)
             rec.setdefault("locked", False)
             rec.setdefault("applied", False)
-            rec.setdefault("orig_localized", g.localized or None)
+            rec.setdefault("orig_unknown", False)
+            rec.setdefault("orig_source", "")
+            rec.setdefault("orig_verified", False)
+            rec.setdefault("cache_entry", False)
+            rec.setdefault("skipped", False)
             rec.setdefault("error", "")
-            # If the stored original name does not match appinfo (Steam update),
-            # keep the user's translation but refresh the original for undo.
-            # Refresh the captured original name only when Steam has actually
-            # changed the live name away from both the original and our target.
-            # If the live name equals our Chinese target, the English original
-            # must be kept for display/revert.
-            current = g.name
+            current = str(g.name or "")
+            current_is_cjk = bool(re.search(r"[\u3400-\u9fff]", current))
             zh = str(rec.get("zh_name") or "")
-            orig = rec.get("orig_name")
+            orig = str(rec.get("orig_name") or "").strip()
+            # Never invent an original from a Chinese current name.  If this is
+            # a translated cache and no canonical original is known yet, leave
+            # it empty and let originals.py ask Steam's English API for it.
             if not orig:
-                rec["orig_name"] = current
-                rec["orig_localized"] = g.localized or rec.get("orig_localized")
-            elif (
-                current != zh
-                and current != orig
-                and str(rec.get("source") or "") != "original"
-            ):
-                # Steam refreshed the real English name.  Do not do this for
-                # records produced by the undo feature: their live name may
-                # still be the old Chinese name for a moment, and treating it
-                # as the original would corrupt the next undo.
-                rec["orig_name"] = current
-                rec["orig_localized"] = g.localized or rec.get("orig_localized")
-            elif not rec.get("orig_localized") and g.localized:
+                if current_is_cjk:
+                    rec["orig_name"] = ""
+                    rec["orig_unknown"] = True
+                else:
+                    rec["orig_name"] = current
+                    rec["orig_unknown"] = False
+                    rec["orig_source"] = "appinfo"
+                    rec["orig_verified"] = False
+                    rec["orig_localized"] = g.localized or rec.get("orig_localized")
+            else:
+                if (
+                    not current_is_cjk
+                    and current != zh
+                    and current != orig
+                    and str(rec.get("source") or "") != "original"
+                ):
+                    # Steam refreshed the real English name; keep the
+                    # translation but update the original for undo.
+                    rec["orig_name"] = current
+                    rec["orig_unknown"] = False
+                    rec["orig_source"] = "appinfo"
+                    rec["orig_verified"] = False
+                    rec["orig_localized"] = g.localized or rec.get("orig_localized")
+                elif not re.search(r"[\u3400-\u9fff]", orig):
+                    rec["orig_unknown"] = False
+            if not rec.get("orig_localized") and not current_is_cjk and g.localized:
                 rec["orig_localized"] = g.localized
 
     def to_settings(self) -> dict[str, Any]:

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import apply, categories, category_batch, category_model, category_state, metadata, paths, scoring, steamenv, translate, undo
+from . import apply, categories, category_batch, category_model, category_state, collections, metadata, originals, paths, providers, scoring, steamenv, translate, undo
 from .metadata import GameInfo
 from .state import State
 
@@ -24,6 +24,8 @@ class Context:
     all_known: bool = False
     new_appids: set[int] = field(default_factory=set)
     warnings: list[str] = field(default_factory=list)
+    originals_pending: set[int] = field(default_factory=set)
+    undo_prepared: bool = False
 
 
 def make_env(settings: dict) -> steamenv.SteamEnv:
@@ -72,17 +74,25 @@ def load_context(settings: dict) -> Context:
 def _attach_originals(ctx: Context) -> None:
     for game in ctx.games:
         rec = ctx.state.get_app(game.appid)
-        game.original_name = str(rec.get("orig_name") or game.name or "")
+        game.original_name = str(rec.get("orig_name") or "")
         if not game.description:
             game.description = str(rec.get("description") or "")
+        try:
+            game.category_evidence = providers.load_category_evidence(game, network=False)
+        except Exception:
+            game.category_evidence = []
 
 
 def merge_state(ctx: Context) -> None:
     ctx.state.merge_games(ctx.games)
+    repair = originals.repair_state(ctx.state, ctx.games, fetch=False)
+    ctx.originals_pending = set(repair.pending)
     _attach_originals(ctx)
     results = scoring.classify_all(ctx.games)
     for g in ctx.games:
         rec = ctx.state.get_app(g.appid)
+        if rec.get("skipped"):
+            continue
         if rec.get("category_locked"):
             cats = category_state.get_categories(rec)
             if cats:
@@ -114,6 +124,8 @@ def auto_categorize(ctx: Context) -> dict[int, str]:
     changed = 0
     for g in ctx.games:
         rec = ctx.state.get_app(g.appid)
+        if rec.get("skipped"):
+            continue
         if rec.get("category_locked"):
             continue
         res = results.get(g.appid)
@@ -128,6 +140,16 @@ def auto_categorize(ctx: Context) -> dict[int, str]:
             reasons=res.reasons,
             locked=False,
         )
+        rec["category_confidence"] = {
+            c: round(float(res.scores.get(c, 0.0)), 3) for c in cats
+        }
+        rec["category_sources"] = {
+            c: [
+                ev.as_dict() for ev in (getattr(g, "category_evidence", []) or [])
+                if c in (getattr(ev, "labels", []) or [])
+            ]
+            for c in cats
+        }
         if tuple(cats) != old:
             changed += 1
     ctx.state.save()
@@ -147,6 +169,63 @@ def batch_undo(ctx: Context, snapshot: dict[int, list[str]]) -> None:
     category_batch.undo_batch(ctx.state, snapshot)
 
 
+def fetch_missing_originals(
+    ctx: Context,
+    proxy: str | None = None,
+    progress: Callable[[int, int, int], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    force: bool = False,
+) -> originals.RepairResult:
+    result = originals.repair_state(
+        ctx.state,
+        ctx.games,
+        fetch=True,
+        force=force,
+        proxy=proxy,
+        progress=progress,
+        should_stop=should_stop,
+    )
+    ctx.originals_pending = set(result.pending)
+    _attach_originals(ctx)
+    ctx.state.save()
+    return result
+
+
+def prepare_originals(ctx: Context) -> originals.RepairResult:
+    result = originals.repair_state(ctx.state, ctx.games, fetch=False)
+    ctx.originals_pending = set(result.pending)
+    _attach_originals(ctx)
+    return result
+
+
+def prepare_undo(
+    ctx: Context,
+    proxy: str | None = None,
+    progress: Callable[[int, int, int], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> originals.UndoPreparation:
+    originals.repair_state(
+        ctx.state,
+        ctx.games,
+        fetch=True,
+        proxy=proxy,
+        progress=progress,
+        should_stop=should_stop,
+    )
+    result = originals.prepare_undo(
+        ctx.env,
+        ctx.state,
+        proxy=proxy,
+        progress=progress,
+        should_stop=should_stop,
+    )
+    ctx.originals_pending = set(result.pending)
+    ctx.undo_prepared = True
+    _attach_originals(ctx)
+    ctx.state.save()
+    return result
+
+
 def auto_translate(
     ctx: Context,
     use_network: bool = True,
@@ -154,14 +233,16 @@ def auto_translate(
     progress: Callable[[int, int, str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     games: list[GameInfo] | None = None,
+    priority_order: list[str] | None = None,
 ) -> dict[int, str]:
-    return translate.translate_games(
+    return providers.translate_games_v2(
         games if games is not None else ctx.games,
         ctx.state,
         use_network=use_network,
         proxy=proxy,
         progress=progress,
         should_stop=should_stop,
+        priority_order=priority_order,
     )
 
 
@@ -211,6 +292,14 @@ def reset_undo_categories(ctx: Context, log: Callable[[str], None] | None = None
     return changed
 
 
+def collection_cleanup_count(ctx: Context) -> int:
+    try:
+        ns = collections.load_json_array(ctx.env.namespace_file)
+        return len(collections.category_collection_keys(ns))
+    except Exception:
+        return 0
+
+
 def counts(ctx: Context) -> dict[str, int]:
     out = {
         "total": len(ctx.games),
@@ -220,6 +309,7 @@ def counts(ctx: Context) -> dict[str, int]:
         "machine": 0,
         "steam": 0,
         "manual": 0,
+        "community": 0,
         "missing": 0,
         "applied": 0,
     }
@@ -231,6 +321,14 @@ def counts(ctx: Context) -> dict[str, int]:
             out["applied"] += 1
         if not rec.get("zh_name"):
             out["missing"] += 1
+        elif src in ("steam_official", "steam_china"):
+            out["official"] += 1
+        elif src in ("dictionary",):
+            out["dictionary"] += 1
+        elif src in ("mymemory",):
+            out["machine"] += 1
+        elif src in ("3dm", "xiaoheihe", "steamdb"):
+            out["community"] += 1
         elif src in out:
             out[src] += 1
         elif src == "already":
@@ -269,6 +367,7 @@ def do_apply(
     lock_appinfo: bool,
     progress: Callable[[str], None] | None = None,
     log: Callable[[str], None] | None = None,
+    mode: str = "both",
 ) -> apply.ApplyResult:
     return apply.apply_changes(
         ctx.env,
@@ -279,7 +378,18 @@ def do_apply(
         lock_appinfo=lock_appinfo,
         progress=progress,
         log=log,
+        mode=mode,
     )
+
+
+def do_apply_names(ctx: Context, selected: set[int] | None, restart: bool,
+                   lock_appinfo: bool, progress=None, log=None):
+    return do_apply(ctx, selected, restart, lock_appinfo, progress, log, mode="names")
+
+
+def do_apply_categories(ctx: Context, selected: set[int] | None, restart: bool,
+                        progress=None, log=None):
+    return do_apply(ctx, selected, restart, False, progress, log, mode="categories")
 
 
 def do_undo_all(
@@ -287,11 +397,13 @@ def do_undo_all(
     restart: bool = True,
     progress: Callable[[str], None] | None = None,
     log: Callable[[str], None] | None = None,
+    mode: str = "both",
 ) -> undo.UndoResult:
     return undo.undo_all(
         ctx.env,
         ctx.state,
         ctx.games,
+        mode=mode,
         restart=restart,
         progress=progress,
         log=log,
@@ -302,8 +414,9 @@ def do_verify(
     ctx: Context,
     wait: float = 12.0,
     log: Callable[[str], None] | None = None,
+    mode: str = "both",
 ) -> apply.ApplyResult:
-    return apply.verify(ctx.env, ctx.state, ctx.games, wait=wait, log=log)
+    return apply.verify(ctx.env, ctx.state, ctx.games, wait=wait, log=log, mode=mode)
 
 
 def do_restore(

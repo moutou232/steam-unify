@@ -66,15 +66,15 @@ class CollectionTests(unittest.TestCase):
         # Hand-made collection untouched.
         self.assertIn("手工分类", collections.existing_user_names(ns))
 
-    def test_name_clash_is_skipped(self):
+    def test_name_clash_is_adopted(self):
         ns = self.base()
         managed = {}
         changed, _, skipped = collections.sync_collections(
             ns, managed, {"手工分类": [99]}
         )
-        self.assertEqual(changed, 0)
-        self.assertEqual(skipped, ["手工分类"])
-        self.assertNotIn("手工分类", managed)
+        self.assertEqual(changed, 1)
+        self.assertEqual(skipped, [])
+        self.assertIn("手工分类", managed)
 
     def test_namespaces_version(self):
         import tempfile

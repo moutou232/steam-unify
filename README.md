@@ -1,140 +1,165 @@
-# Steam 统译 (Steam Unify)
+# Steam 统译 v2.0 (Steam Unify)
 
-[![Tests](https://github.com/moutou232/steam-unify/actions/workflows/tests.yml/badge.svg)](https://github.com/moutou232/steam-unify/actions/workflows/tests.yml)
+[![GitHub](https://img.shields.io/badge/GitHub-moutou232%2Fsteam--unify-181717?logo=github)](https://github.com/moutou232/steam-unify)
+[![Release](https://img.shields.io/badge/release-v2.0.0-blue)](https://github.com/moutou232/steam-unify/releases/tag/v2.0.0)
 
-把 Steam 库里的游戏名补成简体中文，并按类型/标签自动分类（每个游戏最多 3 个分类），写入 Steam 收藏集；重启 Steam 后仍然保留。
+> 下载最新 Windows 便携版：[Releases v2.0.0](https://github.com/moutou232/steam-unify/releases/tag/v2.0.0)
+>
+> v1 程序与 v1 发布包保留在 [v1.0.0](https://github.com/moutou232/steam-unify/releases/tag/v1.0.0)。
 
-本项目是一个 Windows 本地小工具：不需要安装 Python，便携 exe 下载即用；只读写本机 Steam 缓存，不读取、不上传账号密码或令牌。
+把 Steam 库游戏名翻译成简体中文，并按标签/类型/社区来源整理为最多 3 个分类。支持手动修改、独立应用名称或分类、备份导入导出，重启 Steam 后保留。
 
-> Steam Unify is a local Windows utility that translates game names and organizes a Steam library into multi-label collections. It writes only to the local Steam cache and includes backups and a one-click undo.
+> 只读写本机 Steam 本地缓存和本程序数据；不读取、不保存、不上传账号密码、令牌或登录凭据。
 
-![Steam 统译界面](docs/screenshot-ui.png)
+---
 
-## 功能
+## v2.0 新增
 
-- **自动补中文名**：Steam 官方简体中文名 → 内置词典 → Steam 商店/蒸汽平台名称 → MyMemory 机翻。
-- **自动分类**：综合 Steam 类型、商店标签、简介关键词、名称关键词和本地词典，按权重取最多 3 个分类。
-- **Steam 收藏集**：一个游戏最多进入 3 个收藏集；支持视觉小说、恐怖、肉鸽、模拟经营、RPG、动作、策略等分类。
-- **手动编辑**：双击名称修改；双击分类列勾选最多 3 个分类、调整主分类、锁定分类。
-- **批量操作**：复选框多选，批量追加/替换/移除分类；超 3 个自动截断并提示；可撤销上一次批量分类。
-- **启动自动翻译**：新入库游戏可自动联网补名并分类，可在设置中关闭。
-- **备份与一键复原**：应用前完整备份；一键复原会恢复原始英文名、清空分类、删除程序创建的收藏集，并自动重启 Steam。
-- **重启保留**：直接写 Steam appinfo 缓存和收藏集，重启后名称/分类仍然存在。
-- **无需 Python**：便携版 exe + `_internal`，解压即用。
+- **多来源译名**：Steam 官方中文、内置词典、Steam 商店、SteamDB、小黑盒、3DM、MyMemory；右侧“参考源”面板列出来源、译名、置信度、链接，可手动选择默认译名。
+- **多来源分类**：官方标签/类型、内置模型、3DM/SteamDB/小黑盒等社区证据，按权重聚合，最多 3 个分类。
+- **翻译/分类独立**：顶部“翻译名称”“分类整理”“全部”工作区；翻译页只应用名称，分类页只应用分类，互不影响。
+- **原名安全**：原名从 Steam 中文商店页获取（官方中文名，或 Steam 的中文商店英文回退），不再把当前中文名当原名；获取失败显示“原名未知”，后悔药不会假装修复。
+- **缓存级后悔药**：不仅恢复列表里的游戏，还会扫描 appinfo 中未显示在列表的中文条目，从 Steam 中文商店补全原名后一起恢复；中文原名/DLC 不会被误改。
+- **后悔药清理分类**：删除所有静态分类收藏集（包括同名/旧版本/非本程序 ID 的收藏集），让 Steam 游戏恢复未分类；收藏夹、已隐藏和智能过滤收藏集保留。操作前自动备份。
+- **跳过锁区/原名未知**：右键“跳过此游戏”，或点“跳过未知原名”；跳过后不再查询/撤销/翻译/分类该游戏，也不会阻塞后悔药。
+- **同名收藏集接管**：分类写入时按名称识别所有同名静态收藏集，即使不是本程序创建的、或旧 ID 已失效，也会一起更新，不再误判为“手工收藏集”跳过；同名智能过滤收藏集保持不变。
+- **备份导入/导出**：手动导出 `.zip` 完整备份，校验后导入；跨缓存格式/跨账号默认拒绝。
+- **大库优化**：表格只绘制可见行，搜索 debounce，批量保存合并，1000+ 游戏滚动更顺畅。
+- **新旧 Steam 缓存**：自动识别旧版 `appinfo.vdf` 和新版 `appinfo/appinfo_XX.vdf`；不再直接打开不存在的旧文件。
 
-## 下载
+---
 
-从 Releases 下载 Windows 便携版：
+## 运行
 
-https://github.com/moutou232/steam-unify/releases/latest
+### 便携版
 
+解压 `Steam统译_v2_便携版.zip`，双击：
+
+```text
+Steam统译_v2.exe
 ```
-Steam统译_便携版.zip
-```
 
-解压后运行 `Steam统译.exe`：
+必须保留同目录的 `_internal`，不能只拷 exe。首次运行会在旁边创建 `data`、`backups`。
 
-- 必须保留同目录的 `_internal` 文件夹，不能只单独拷走 exe；
-- 首次运行会在 exe 旁边创建 `data` 和 `backups`；
-- 建议先备份 Steam 库。
+### 源码
 
-## 使用
-
-1. 解压压缩包，双击 `Steam统译.exe`；
-2. 等待扫描 Steam 库；
-3. 检查中文名和分类，双击可编辑；
-4. 点击“应用全部”或“应用选中”；
-5. 程序会关闭 Steam、备份、写入并重新启动 Steam；
-6. 重启 Steam 查看中文名和收藏集。
-
-如果分类或名称被 Steam 更新覆盖，可以点“一键修复”；想重新开始，点“一键复原（后悔药）”。
-
-## 从源码运行
-
-需要 Windows + Python 3.10+（开发环境为 Python 3.13）。
+需要 Windows + Python 3.10+：
 
 ```powershell
-git clone https://github.com/moutou232/steam-unify.git
-cd steam-unify
+cd steam-zh-v2
 python run.py
 ```
 
-项目只使用标准库和 tkinter，不需要安装第三方运行依赖。
+或双击 `启动.bat`。
 
-构建便携版（需要 PyInstaller）：
+---
+
+## 功能
+
+### 翻译名称
+
+- 自动翻译缺失名称；已有手动锁定不会覆盖。
+- 侧栏参考源显示：来源、译名、置信度、URL、失败原因。
+- 选择某个来源译名后写入 `name_selected_source` 并锁定。
+- 应用名称只写 appinfo/ACF，不写收藏集。
+
+### 分类整理
+
+- 自动分类：Steam 标签/类型 + 本地模型 + 缓存社区证据，按权重评分。
+- 最多 3 个分类，第一个为主分类；可批量追加/替换/移除。
+- 侧栏显示分类来源与置信度。
+- 应用分类只写 Steam 收藏集，不改游戏名。
+
+### 参考源优先级
+
+译名基础权重（实际分数还会乘名称匹配质量）：
+
+| 来源 | 基础置信度 |
+|---|---:|
+| 手动选择 | 1.00 |
+| Steam 内置中文 | 0.98 |
+| Steam 商店 | 0.92 |
+| 小黑盒 | 0.90 |
+| 本地词典 | 0.88 |
+| 3DM | 0.85 |
+| SteamDB | 0.78 |
+| MyMemory | 0.45 |
+
+同分时按：手动 > 官方 > 小黑盒 > 3DM > SteamDB > 词典 > 商店 > 机翻。
+
+> SteamDB/小黑盒/3DM 为公共页面/接口的尽力抓取，可能 403、改版或无结果；不会阻塞其他来源。所有候选只在本机缓存，不保证每个游戏都能找到。
+
+### 备份
+
+- **导出备份**：生成包含 `state.json`、appinfo、Steam 收藏集、ACF 的 zip，带 manifest 和 SHA256。
+- **导入备份**：校验格式/路径/账号/缓存类型后，先备份当前数据，再关闭 Steam 还原并重启。
+- 自动备份位于 exe 旁 `backups/`；备份含个人游戏状态，请勿公开分享。
+
+---
+
+## 数据与兼容
+
+- 状态文件 `data/state.json`，v2 使用 schema v3；自动从 v2 迁移并保留 `state.v2.bak`。
+- 旧版单文件：`appcache/appinfo.vdf` 或 `steamapps/appinfo.vdf`。
+- 新版分片：`appcache/appinfo/appinfo_XX.vdf`，兼容 80/81 字节索引及 4 字节索引前缀/后缀。
+- 一个分片损坏时会跳过并记录警告，不影响其他分片；全部缓存不可读时才报错。
+
+---
+
+## 构建
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File build_exe.ps1
+cd steam-zh-v2
+.\build_exe.ps1
 ```
 
-## 安全说明
+输出：
 
-- 仅修改本机 Steam 本地缓存，不读取、不保存、不上传 Steam 账号、密码、令牌或登录凭据。
-- 应用前把 appinfo、收藏集、localconfig、ACF 备份到 `backups/`。
-- 写入失败会回滚，并尽量重新启动 Steam。
-- 游戏名写入 appinfo，本机所有账号共享；收藏集只写当前账号。
-- 未签名 exe 可能触发 Windows SmartScreen，这是本地工具常见情况；源码公开，可自行审查/构建。
-- 本工具不是 Valve/Steam 官方工具，与 Valve 无关；使用风险自担。
-
-## 已知限制
-
-- 翻译是官方名/词典/商店/机翻的组合，无法保证每个译名都符合个人偏好。
-- 分类是启发式评分，不是大模型，不能保证 100% 准确；Steam 标签本身也有噪声。
-- 简介关键词依赖 Steam 商店可访问性，无法访问时只使用标签/类型/名称/词典。
-- Steam 客户端升级可能改变缓存格式；程序会校验格式，无法识别时拒绝写入。
-- 不同账号共享 appinfo；收藏集属于当前登录账号。
-
-## 工作原理
-
-- 旧版 Steam：`appcache/appinfo.vdf`（v29）。
-- 新版 Steam：`appcache/appinfo/appinfo_XX.vdf` 分片（v30），程序会同步索引偏移、数据大小和 CRC32。
-- 兼容新出现的 81 字节索引记录及 4 字节索引前缀/后缀；单个无法识别的分片会跳过并记录警告，不会让整个扫描失败。
-- 分类写入 `userdata/<account>/config/cloudstorage/cloud-storage-namespace-1.json` 的 Steam 收藏集记录。
-- 状态保存在 `data/state.json`；`orig_name`、`orig_localized` 用于一键复原；所有分类最多 3 个。
-
-## 项目结构
-
-```
-steam_zh/
-  appinfo.py            旧版 appinfo.vdf 读写
-  appinfo_shards.py     新版分片读写 + CRC
-  apply.py              备份/应用/校验/还原/修复
-  category_model.py     分类权重模型
-  scoring.py            多标签评分
-  category_state.py     v2 状态与 3 标签上限
-  category_batch.py     批量分类
-  undo.py               一键复原
-  collections.py        Steam 收藏集
-  translate.py          名称翻译
-  gui.py / gui_dialogs.py / ui_widgets.py
-data/                   内置词典和分类模型（不含个人状态）
-tests/                  单元测试
-docs/                   截图
+```text
+Steam统译_v2\Steam统译_v2.exe
 ```
 
-`data/state.json`、`settings.json`、`backups/` 是运行数据，已加入 `.gitignore`，不会提交。
+构建脚本只更新 `Steam统译_v2`，不会覆盖 v1 的 `Steam统译`。
 
-## 测试
+---
 
-```powershell
-python -m unittest discover -s tests -v
+## 目录
+
+```text
+steam-zh-v2\                 源码
+Steam统译_v2\                v2 便携版
+Steam统译_v2_便携版.zip      v2 发布包
+Steam统译\                   v1，保留不动
+Steam统译_便携版.zip         v1，保留不动
 ```
 
-测试覆盖多标签评分、批量截断、回滚、状态迁移、收藏集同步、原件不可覆盖等。依赖本机 Steam 缓存的测试在无 Steam 环境会自动跳过。
+---
 
-## 贡献
+## 隐私与限制
 
-欢迎提交 Issue / PR，尤其是：
+- 程序不读取账号密码/令牌；只读写本机 Steam 缓存和本程序 `data`。
+- 社区来源为公开页面/接口，可能受访问限制、验证码或反爬影响。
+- 备份文件包含个人游戏库状态；导入他人备份前请确认来源。
+- 修改 Steam 本地缓存前请退出正在运行的游戏；程序会自动备份，但仍建议保留自己的备份。
 
-- 分类不准确的游戏（请附 AppID 和期望分类）；
-- 翻译错误；
-- Steam 客户端新格式的兼容问题；
-- UI/交互改进。
 
-## License
+## v2.1 界面重构
 
-MIT
+- **紧凑分区**：全局菜单栏、标题栏、工作区选项卡、单行上下文操作栏、筛选栏、游戏列表、右侧参考源、底部状态栏。
+- **选项卡联动**：翻译名称只显示翻译操作，分类整理只显示分类操作，全部显示综合操作；表格列同步切换。
+- **工具收纳**：导出清单/备份/导入备份/补全原名/跳过未知原名/补全简介/设置统一进入 `⚙ 工具`。
+- **危险隔离**：`⚠ 危险` 菜单提供“只复原名称 / 只复原分类 / 全部复原”，必须输入“复原”确认。
+- **按钮状态**：未选中游戏时“应用选中”“批量分类”置灰；无快照时“撤销批量”置灰。
+- **默认最大化**：启动默认最大化并保留标题栏；设置中可改为无边框全屏或窗口化，并记住窗口大小。
+- **列表优先**：固定区域压缩到约 216px，游戏列表获得剩余高度，默认明显超过 50%。
 
-## 免责声明
+- **小黑盒名称修复**：改用公开的 `game/web/get_game_detail?appid=...&_time=...` 详情接口（Steam appid 直查），旧搜索接口签名失效时自动回退到分享页 `<title>`。
 
-本项目与 Valve Corporation / Steam 无关联。修改本地缓存有风险，请在使用前备份，并在了解风险的前提下自行决定是否使用。
+
+## 自定义参考源优先级
+
+- 设置 → 参考源优先级 → 调整。
+- 支持上移/下移/恢复默认；顺序保存到 `settings.json`。
+- 手动选择的译名始终最高，不会被自动重排。
+- 可勾选“保存后按新顺序重选已有自动译名”，只改本地状态，仍需点“应用名称”才写入 Steam。
+- 分类来源权重不受名称优先级影响。

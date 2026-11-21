@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import appinfo, category_state, collections, paths, steamenv, vdftext
+from . import appinfo, cache, category_state, collections, paths, steamenv, vdftext
 from .appinfo_shards import ShardSet
 from .metadata import GameInfo
 from .state import State, now_ts
@@ -20,6 +20,7 @@ BASE_DIR = paths.app_dir()
 BACKUP_ROOT = BASE_DIR / "backups"
 
 SKIP_CATEGORIES = {"", "不分类", "未分类", "none", "null"}
+APPLY_MODES = ("names", "categories", "both")
 
 
 class ApplyError(Exception):
@@ -150,6 +151,8 @@ def backup(
         "steam_root": str(env.root),
         "files": files,
         "managed_collections": dict(state.collections),
+        "collection_ids": {k: list(v) for k, v in state.collection_ids.items()},
+        "collection_owned": {k: list(v) for k, v in state.collection_owned.items()},
     }
     (dest / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -179,12 +182,62 @@ def _plan_names(
         if selected is not None and g.appid not in selected:
             continue
         rec = state.get_app(g.appid)
+        if rec.get("skipped"):
+            continue
         zh = str(rec.get("zh_name") or "").strip()
         if not zh:
             continue
         planned.append(g)
         names[g.appid] = zh
     return planned, names
+
+
+def _sync_categories(
+    env: steamenv.SteamEnv,
+    state: State,
+    games: list[GameInfo],
+    result: ApplyResult,
+    progress: Callable[[str], None] | None,
+    log: Callable[[str], None] | None,
+) -> None:
+    computed: dict[str, list[int]] = {}
+    for g in games:
+        rec = state.get_app(g.appid)
+        if rec.get("skipped"):
+            continue
+        for cat in category_state.get_categories(rec):
+            cat = str(cat).strip()
+            if not cat or cat.lower() in SKIP_CATEGORIES:
+                continue
+            bucket = computed.setdefault(cat, [])
+            if g.appid not in bucket:
+                bucket.append(g.appid)
+    if not computed:
+        return
+    if progress:
+        progress("正在写入 Steam 收藏集 ...")
+    ns = collections.load_json_array(env.namespace_file)
+    changed, version, skipped = collections.sync_collections(
+        ns,
+        state.collections,
+        computed,
+        state.collection_ids,
+        state.collection_owned,
+    )
+    result.collections_changed = changed
+    result.collection_skipped = skipped
+    if changed:
+        def write_collections() -> None:
+            collections.write_json_array(env.namespace_file, ns)
+            collections.update_namespaces_version(env.namespaces_file, 1, version)
+
+        _retry_write(write_collections)
+        if log:
+            log(f"已更新 {changed} 个收藏集（同名静态收藏集一起更新）")
+    if skipped:
+        result.warnings.append(
+            "以下同名智能收藏集使用过滤规则，未直接改写: " + "、".join(skipped)
+        )
 
 
 def apply_changes(
@@ -196,8 +249,12 @@ def apply_changes(
     lock_appinfo: bool = False,
     progress: Callable[[str], None] | None = None,
     log: Callable[[str], None] | None = None,
+    mode: str = "both",
 ) -> ApplyResult:
+    if mode not in APPLY_MODES:
+        raise ValueError(f"unknown apply mode: {mode}")
     result = ApplyResult()
+    cache_info = cache.AppInfoCache.detect(env).require()
     preflight_writable(env)
     was_running = steamenv.steam_running()
     if was_running:
@@ -206,21 +263,25 @@ def apply_changes(
         steamenv.close_steam(env, log=log)
         # Give Steam a moment to release its handles on cloudstorage files.
         time.sleep(2.0)
+        cache_info = cache.AppInfoCache.detect(env, wait=3.0).require()
     result.backup = backup(env, state, steamenv.installed_apps(env.root))
     if log:
         log(f"已备份到 {result.backup}")
     if progress:
-        progress("已备份，正在写入 appinfo.vdf ...")
+        progress(f"已备份，正在写入 {cache_info.describe()} ...")
 
     # Make sure appinfo is writable (we may have locked it previously).
-    if not env.has_shards and is_readonly(env.appinfo):
-        _set_readonly(env.appinfo, False)
+    if cache_info.kind == cache.CacheKind.MONOLITHIC and cache_info.appinfo_path and is_readonly(cache_info.appinfo_path):
+        _set_readonly(cache_info.appinfo_path, False)
 
     try:
-        planned, names = _plan_names(state, games, selected)
+        if mode == "categories":
+            planned, names = [], {}
+        else:
+            planned, names = _plan_names(state, games, selected)
         changed_ids: list[int] = []
-        if env.has_shards:
-            ss = ShardSet.load(env.shard_dir)
+        if cache_info.kind == cache.CacheKind.SHARDS:
+            ss = cache_info.load_shards()
             for g in planned:
                 zh = names[g.appid]
                 try:
@@ -241,7 +302,7 @@ def apply_changes(
             if lock_appinfo:
                 result.warnings.append("分片 appinfo 模式不支持只读锁定，已跳过")
         else:
-            ai = appinfo.AppInfo.load(env.appinfo)
+            ai = cache_info.load_appinfo()
             for g in planned:
                 zh = names[g.appid]
                 try:
@@ -259,18 +320,20 @@ def apply_changes(
                     result.warnings.append(f"{g.appid} {g.name}: {exc}")
             if changed_ids:
                 data = ai.build()
-                tmp = env.appinfo.with_name(env.appinfo.name + ".tmp")
+                appinfo_path = cache_info.appinfo_path
+                assert appinfo_path is not None
+                tmp = appinfo_path.with_name(appinfo_path.name + ".tmp")
 
                 def write_appinfo() -> None:
                     with open(tmp, "wb") as f:
                         f.write(data)
                         f.flush()
                         os.fsync(f.fileno())
-                    os.replace(tmp, env.appinfo)
+                    os.replace(tmp, appinfo_path)
 
                 _retry_write(write_appinfo)
                 if lock_appinfo:
-                    _set_readonly(env.appinfo, True)
+                    _set_readonly(appinfo_path, True)
 
         result.names_applied = len(changed_ids)
         if log:
@@ -297,48 +360,8 @@ def apply_changes(
             except Exception as exc:
                 result.warnings.append(f"更新 {acf.name} 失败: {exc}")
 
-        # Categories -> Steam collections (a game may have up to 3 labels).
-        computed: dict[str, list[int]] = {}
-        for g in games:
-            rec = state.get_app(g.appid)
-            for cat in category_state.get_categories(rec):
-                cat = str(cat).strip()
-                if not cat or cat.lower() in SKIP_CATEGORIES:
-                    continue
-                bucket = computed.setdefault(cat, [])
-                if g.appid not in bucket:
-                    bucket.append(g.appid)
-        if computed:
-            if progress:
-                progress("正在写入 Steam 收藏集 ...")
-            ns = collections.load_json_array(env.namespace_file)
-            if not state.collections:
-                # Account switch / restored state: adopt collections that carry
-                # our category names instead of creating duplicates.
-                existing = collections.existing_user_names(ns)
-                for cat in computed:
-                    key = existing.get(cat.lower())
-                    if key and key.startswith(collections.COLLECTION_PREFIX):
-                        state.collections[cat] = key[len(collections.COLLECTION_PREFIX):]
-                if state.collections and log:
-                    log(f"已接管 {len(state.collections)} 个同名收藏集")
-            changed, version, skipped = collections.sync_collections(
-                ns, state.collections, computed
-            )
-            result.collections_changed = changed
-            result.collection_skipped = skipped
-            if changed:
-                def write_collections() -> None:
-                    collections.write_json_array(env.namespace_file, ns)
-                    collections.update_namespaces_version(env.namespaces_file, 1, version)
-
-                _retry_write(write_collections)
-                if log:
-                    log(f"已更新 {changed} 个收藏集")
-            if skipped:
-                result.warnings.append(
-                    "以下分类已存在手工收藏集，已跳过: " + "、".join(skipped)
-                )
+        if mode != "names":
+            _sync_categories(env, state, games, result, progress, log)
 
         for appid in changed_ids:
             state.set_app(appid, applied=True, applied_at=now_ts())
@@ -383,38 +406,53 @@ def verify(
     games: list[GameInfo],
     wait: float = 12.0,
     log: Callable[[str], None] | None = None,
+    mode: str = "both",
 ) -> ApplyResult:
+    if mode not in APPLY_MODES:
+        raise ValueError(f"unknown verify mode: {mode}")
     result = ApplyResult()
     if wait:
         time.sleep(wait)
     if not steamenv.steam_running():
         result.warnings.append("校验时 Steam 未运行")
-    ss = ShardSet.load(env.shard_dir) if env.has_shards else None
-    ai = appinfo.AppInfo.load(env.appinfo) if not env.has_shards else None
-    for g in games:
-        rec = state.get_app(g.appid)
-        zh = str(rec.get("zh_name") or "").strip()
-        if not zh:
-            continue
-        current = (ss.get_name(g.appid) if ss else ai.get_name(g.appid)) or ""
-        if current == zh:
-            result.verified_names += 1
-        else:
-            result.verify_failed.append(g.appid)
-    try:
-        ns = collections.load_json_array(env.namespace_file)
-        live_ids = set()
-        for item in ns:
-            if isinstance(item, list) and len(item) == 2 and isinstance(item[0], str):
-                if item[0].startswith(collections.COLLECTION_PREFIX) and not item[1].get("is_deleted"):
-                    live_ids.add(item[0])
-        result.collections_verified = all(
-            collections.COLLECTION_PREFIX + cid in live_ids
-            for cid in state.collections.values()
-            if cid
-        )
-    except Exception as exc:
-        result.warnings.append(f"校验收藏集失败: {exc}")
+    cache_info = cache.AppInfoCache.detect(env, wait=1.0).require()
+    ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
+    ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
+    if mode in ("both", "names"):
+        for g in games:
+            rec = state.get_app(g.appid)
+            if rec.get("skipped"):
+                continue
+            zh = str(rec.get("zh_name") or "").strip()
+            if not zh:
+                continue
+            current = (ss.get_name(g.appid) if ss else ai.get_name(g.appid)) or ""
+            if current == zh:
+                result.verified_names += 1
+            else:
+                result.verify_failed.append(g.appid)
+    if mode in ("both", "categories"):
+        try:
+            ns = collections.load_json_array(env.namespace_file)
+            live_ids = set()
+            for item in ns:
+                if isinstance(item, list) and len(item) == 2 and isinstance(item[0], str):
+                    if item[0].startswith(collections.COLLECTION_PREFIX) and not item[1].get("is_deleted"):
+                        live_ids.add(item[0])
+            managed_ids = [
+                cid
+                for values in state.collection_ids.values()
+                for cid in values
+                if cid
+            ]
+            if not managed_ids:
+                managed_ids = [cid for cid in state.collections.values() if cid]
+            result.collections_verified = all(
+                collections.COLLECTION_PREFIX + cid in live_ids
+                for cid in managed_ids
+            )
+        except Exception as exc:
+            result.warnings.append(f"校验收藏集失败: {exc}")
     if log:
         log(
             f"校验：名称 {result.verified_names} 个正确，"
@@ -490,6 +528,8 @@ def _restore_files(
                     break
     if restore_state:
         managed: dict[str, str] = {}
+        collection_ids: dict[str, list[str]] = {}
+        collection_owned: dict[str, list[str]] = {}
         manifest_path = backup_dir / "manifest.json"
         if manifest_path.is_file():
             try:
@@ -497,9 +537,29 @@ def _restore_files(
                 raw = manifest.get("managed_collections")
                 if isinstance(raw, dict):
                     managed = {str(k): str(v) for k, v in raw.items()}
+                raw_ids = manifest.get("collection_ids")
+                if isinstance(raw_ids, dict):
+                    collection_ids = {
+                        str(k): [str(x) for x in v]
+                        for k, v in raw_ids.items()
+                        if isinstance(v, list)
+                    }
+                raw_owned = manifest.get("collection_owned")
+                if isinstance(raw_owned, dict):
+                    collection_owned = {
+                        str(k): [str(x) for x in v]
+                        for k, v in raw_owned.items()
+                        if isinstance(v, list)
+                    }
             except (OSError, json.JSONDecodeError):
                 managed = {}
+        if not collection_ids:
+            collection_ids = {k: [v] for k, v in managed.items() if v}
+        if not collection_owned:
+            collection_owned = {k: list(v) for k, v in collection_ids.items()}
         state.data["collections"] = managed
+        state.data["collection_ids"] = collection_ids
+        state.data["collection_owned"] = collection_owned
         for rec in state.apps.values():
             rec["applied"] = False
         state.save()

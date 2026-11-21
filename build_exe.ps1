@@ -7,7 +7,7 @@ if ($LASTEXITCODE -ne 0) { throw "PyInstaller 安装失败，请检查网络或 
 
 python -m PyInstaller `
     --noconfirm --clean --onedir --windowed `
-    --name "Steam统译" `
+    --name "Steam统译_v2" `
     --icon "assets\steam_zh.ico" `
     --add-data "data;data" `
     --distpath "dist" `
@@ -16,8 +16,8 @@ python -m PyInstaller `
     "run.py"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建失败" }
 
-$target = Join-Path (Split-Path $PSScriptRoot -Parent) "Steam统译"
+$target = Join-Path (Split-Path $PSScriptRoot -Parent) "Steam统译_v2"
 if (Test-Path $target) { Remove-Item $target -Recurse -Force }
-Copy-Item (Join-Path $PSScriptRoot "dist\Steam统译") $target -Recurse
+Copy-Item (Join-Path $PSScriptRoot "dist\Steam统译_v2") $target -Recurse
 Copy-Item (Join-Path $PSScriptRoot "README.md") (Join-Path $target "README.md") -Force
-Write-Host "已生成: $target\Steam统译.exe"
+Write-Host "已生成: $target\Steam统译_v2.exe"

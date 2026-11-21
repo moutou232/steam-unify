@@ -54,6 +54,21 @@ COLUMNS: list[tuple[str, str, int, str]] = [
     ("status", "状态", 64, "center"),
 ]
 
+COLUMN_PROFILES: dict[str, list[tuple[str, str, int, str]]] = {
+    "names": [
+        ("check", "", 28, "center"),
+        ("game", "游戏名 / 原名", 520, "w"),
+        ("status", "状态", 72, "center"),
+    ],
+    "categories": [
+        ("check", "", 28, "center"),
+        ("game", "游戏名 / 原名", 300, "w"),
+        ("categories", "分类", 300, "w"),
+        ("status", "状态", 72, "center"),
+    ],
+    "both": COLUMNS,
+}
+
 ROW_H = 44
 HEADER_H = 38
 PILL_H = 20
@@ -105,18 +120,20 @@ class TagTable(tk.Frame):
         self.sort_key = ""
         self.sort_desc = True
         self._render_after: str | None = None
+        self._scroll_render: str | None = None
         self._last_selected: int | None = None
+        self.columns = list(COLUMNS)
 
         self.body_font = tkfont.Font(family="Microsoft YaHei UI", size=10)
         self.small_font = tkfont.Font(family="Microsoft YaHei UI", size=9)
         self.bold_font = tkfont.Font(family="Microsoft YaHei UI", size=10, weight="bold")
         self.header_font = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
 
-        total_w = sum(c[2] for c in COLUMNS)
+        total_w = sum(c[2] for c in self.columns)
         self.total_width = total_w
         self.x_offsets: dict[str, tuple[int, int]] = {}
         x = 0
-        for key, _title, width, _anchor in COLUMNS:
+        for key, _title, width, _anchor in self.columns:
             self.x_offsets[key] = (x, x + width)
             x += width
 
@@ -143,7 +160,7 @@ class TagTable(tk.Frame):
         self.vsb.grid(row=0, column=1, sticky="ns")
         self.hsb = tk.Scrollbar(wrap, orient="horizontal", command=self._xview)
         self.hsb.grid(row=1, column=0, sticky="ew")
-        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.canvas.configure(yscrollcommand=self._on_yscroll)
         self.canvas.configure(xscrollcommand=self._body_xscroll)
         self.header.configure(xscrollcommand=self._header_xscroll)
 
@@ -155,11 +172,29 @@ class TagTable(tk.Frame):
         self.canvas.bind("<Leave>", self._on_leave)
         self.canvas.bind("<Button-3>", self._on_right)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Configure>", lambda _e: self._schedule_render())
         self.header.bind("<Button-1>", self._on_header_click)
         self.header.bind("<MouseWheel>", self._on_wheel)
         self.bind("<Control-a>", lambda _e: self.select_all_checked())
 
     # ---------------------------------------------------------------- data
+    def set_profile(self, profile: str) -> None:
+        columns = COLUMN_PROFILES.get(profile, COLUMNS)
+        if columns is self.columns:
+            return
+        self.columns = list(columns)
+        self.total_width = sum(c[2] for c in self.columns)
+        self.x_offsets = {}
+        x = 0
+        for key, _title, width, _anchor in self.columns:
+            self.x_offsets[key] = (x, x + width)
+            x += width
+        self.header.configure(scrollregion=(0, 0, self.total_width, HEADER_H))
+        self.canvas.configure(
+            scrollregion=(0, 0, self.total_width, max(ROW_H, ROW_H * len(self.rows)))
+        )
+        self.render()
+
     def set_rows(self, rows: list[TableRow]) -> None:
         self.rows = rows
         visible = {r.appid for r in rows}
@@ -236,7 +271,13 @@ class TagTable(tk.Frame):
                 font=self.body_font, anchor="nw",
             )
             return
-        for idx, row in enumerate(self.rows):
+        height = max(1, self.canvas.winfo_height())
+        top = self.canvas.canvasy(0)
+        bottom = self.canvas.canvasy(height)
+        start = max(0, int(top // ROW_H) - 5)
+        end = min(len(self.rows), int(bottom // ROW_H) + 6)
+        for idx in range(start, end):
+            row = self.rows[idx]
             y = idx * ROW_H
             bg = ZEBRA if idx % 2 else PANEL
             if row.appid in self.selected:
@@ -272,18 +313,19 @@ class TagTable(tk.Frame):
                     fill=MUTED, font=self.small_font, anchor="w",
                 )
             # category pills
-            x1, x2 = self.x_offsets["categories"]
-            px = x1 + 8
-            max_right = x2 - 10
-            cats = row.categories[:3]
-            if not cats:
-                self._pill(px, y + 12, "未分类", max_right)
-            else:
-                for cat in cats:
-                    nx = self._pill(px, y + 12, cat, max_right)
-                    if nx == px:
-                        break
-                    px = nx
+            if "categories" in self.x_offsets:
+                x1, x2 = self.x_offsets["categories"]
+                px = x1 + 8
+                max_right = x2 - 10
+                cats = row.categories[:3]
+                if not cats:
+                    self._pill(px, y + 12, "未分类", max_right)
+                else:
+                    for cat in cats:
+                        nx = self._pill(px, y + 12, cat, max_right)
+                        if nx == px:
+                            break
+                        px = nx
             x1, x2 = self.x_offsets["status"]
             c.create_text(
                 (x1 + x2) / 2, y + ROW_H / 2,
@@ -300,7 +342,7 @@ class TagTable(tk.Frame):
         h.create_rectangle(12, 11, 29, 28, outline="#5f7a90", fill="")
         if self.rows and {r.appid for r in self.rows} <= self.checked:
             h.create_line(16, 20, 20, 24, 26, 15, fill=ACCENT, width=2)
-        for key, title, width, _anchor in COLUMNS:
+        for key, title, width, _anchor in self.columns:
             x1, x2 = self.x_offsets[key]
             if key == "check":
                 continue
@@ -459,6 +501,18 @@ class TagTable(tk.Frame):
 
     def _on_wheel(self, event: tk.Event) -> None:
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _on_yscroll(self, first: str, last: str) -> None:
+        self.vsb.set(first, last)
+        self._schedule_render()
+
+    def _schedule_render(self) -> None:
+        if self._scroll_render is None:
+            self._scroll_render = self.after_idle(self._do_scroll_render)
+
+    def _do_scroll_render(self) -> None:
+        self._scroll_render = None
+        self.render()
 
     def _yview(self, *args: Any) -> None:
         self.canvas.yview(*args)

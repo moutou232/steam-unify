@@ -22,6 +22,16 @@ from typing import Any, Iterable
 from . import category_model
 from .metadata import GameInfo
 
+CATEGORY_SOURCE_WEIGHT = {
+    "steam_tags": 0.85,
+    "steam_genres": 0.75,
+    "local_model": 0.70,
+    "steamdb": 0.65,
+    "xiaoheihe": 0.55,
+    "3dm": 0.50,
+    "description": 0.45,
+}
+
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9'’+.-]*", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 
@@ -198,8 +208,23 @@ def classify(
                 weight = min(NAME_CAP, hits * float(model.get("name_weight", 0.75)))
                 _add(scores, reasons, cat, weight, f"名称关键词 +{weight:g}")
 
-    # Remove zero/unknown categories; keep only configured labels.
+    # 5. external community category evidence (best-effort, cached)
     allowed = set(model.get("categories", []))
+    for evidence in getattr(game, "category_evidence", []) or []:
+        try:
+            labels = getattr(evidence, "labels", []) or []
+            confidence = float(getattr(evidence, "confidence", 0.5))
+            source = str(getattr(evidence, "source", "community"))
+        except Exception:
+            continue
+        for cat in labels:
+            cat = str(cat).strip()
+            if cat in allowed:
+                base = CATEGORY_SOURCE_WEIGHT.get(source, 0.5)
+                weight = 5.0 * base * max(0.0, min(1.0, confidence))
+                _add(scores, reasons, cat, weight, f"{source} +{weight:g}")
+
+    # Remove zero/unknown categories; keep only configured labels.
     scores = {c: s for c, s in scores.items() if c in allowed and s > 0}
     if not scores:
         return CategoryResult(["其他"], {}, {}, "auto")

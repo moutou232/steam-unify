@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import appinfo, apply, category_state, collections, steamenv, vdftext
+from . import appinfo, apply, cache, category_state, collections, steamenv, vdftext
 from .appinfo_shards import ShardSet
 from .state import State
 
@@ -21,6 +21,7 @@ from .state import State
 class UndoResult:
     backup: Path | None = None
     names_restored: int = 0
+    names_skipped: int = 0
     categories_cleared: int = 0
     collections_deleted: int = 0
     warning: list[str] = field(default_factory=list)
@@ -32,11 +33,15 @@ def undo_all(
     state: State,
     games: list,
     *,
+    mode: str = "both",
     restart: bool = True,
     progress: Callable[[str], None] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> UndoResult:
+    if mode not in ("names", "categories", "both"):
+        raise ValueError(f"unknown undo mode: {mode}")
     result = UndoResult()
+    cache_info = cache.AppInfoCache.detect(env).require()
     apply.preflight_writable(env)
     was_running = steamenv.steam_running()
     if was_running:
@@ -44,6 +49,7 @@ def undo_all(
             log("Steam 正在运行，正在自动关闭 ...")
         steamenv.close_steam(env, log=log)
         time.sleep(2.0)
+        cache_info = cache.AppInfoCache.detect(env, wait=3.0).require()
 
     result.backup = apply.backup(env, state, steamenv.installed_apps(env.root))
     if log:
@@ -52,19 +58,22 @@ def undo_all(
     try:
         appids = sorted(int(a) for a in state.apps.keys())
         total = max(1, len(appids))
-        ss = ShardSet.load(env.shard_dir) if env.has_shards else None
-        ai = appinfo.AppInfo.load(env.appinfo) if not env.has_shards else None
+        ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
+        ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
         changed_appinfo = False
 
         for index, appid in enumerate(appids, 1):
             rec = state.get_app(appid)
+            if rec.get("skipped"):
+                continue
             orig = str(rec.get("orig_name") or "").strip()
             zh = str(rec.get("zh_name") or "").strip()
+            verified = bool(rec.get("orig_verified"))
             cats = category_state.get_categories(rec)
-            if cats:
+            if cats and mode != "names":
                 result.categories_cleared += 1
 
-            if orig:
+            if mode != "categories" and orig and verified:
                 exists = (appid in ss.by_appid) if ss is not None else bool(ai.entry(appid))
                 if exists:
                     current = (ss.get_name(appid) if ss else ai.get_name(appid)) or ""
@@ -90,12 +99,19 @@ def undo_all(
                         rec["zh_name"] = orig
                         rec["source"] = "original"
                         rec["detail"] = "已一键复原"
+                        rec["orig_unknown"] = False
+                        rec["orig_verified"] = True
                         rec["locked"] = True
                         rec["applied"] = False
                         rec.pop("translated_at", None)
                         rec.pop("applied_at", None)
+            else:
+                if mode != "categories":
+                    result.names_skipped += 1
+                    rec["orig_unknown"] = True
 
-            category_state.set_categories(rec, [], source="undo", locked=True)
+            if mode != "names":
+                category_state.set_categories(rec, [], source="undo", locked=True)
             if progress:
                 progress(f"恢复 {index}/{total}")
             if log and index % 40 == 0:
@@ -106,20 +122,25 @@ def undo_all(
                 if ss:
                     ss.save()
                 else:
+                    assert ai is not None
                     data = ai.build()
-                    tmp = env.appinfo.with_name(env.appinfo.name + ".tmp")
+                    target = cache_info.appinfo_path
+                    assert target is not None
+                    tmp = target.with_name(target.name + ".tmp")
                     with open(tmp, "wb") as f:
                         f.write(data)
                         f.flush()
                         import os
                         os.fsync(f.fileno())
-                    os.replace(tmp, env.appinfo)
+                    os.replace(tmp, target)
 
             apply._retry_write(write_appinfo)
 
         # Restore ACF names as well (cosmetic, but keeps library consistent).
         installed = steamenv.installed_apps(env.root)
         for appid in appids:
+            if mode == "categories":
+                continue
             rec = state.get_app(appid)
             orig = str(rec.get("orig_name") or "").strip()
             info = installed.get(appid)
@@ -134,11 +155,12 @@ def undo_all(
             except OSError as exc:
                 result.warning.append(f"{acf.name}: {exc}")
 
-        # Remove all program-created Steam collections.  User-created
-        # collections are not in state.collections and are never touched.
-        if state.collections:
+        # Undo removes all static non-system user collections.  Steam uses
+        # collection membership for categories, so leaving same-name/adopted
+        # collections behind would leave games categorized.
+        if mode != "names":
             ns = collections.load_json_array(env.namespace_file)
-            deleted, version = collections.tombstone_collections(ns, state.collections)
+            deleted, version = collections.tombstone_category_collections(ns)
             if deleted:
                 def write_collections() -> None:
                     collections.write_json_array(env.namespace_file, ns)
@@ -149,6 +171,8 @@ def undo_all(
                 apply._retry_write(write_collections)
                 result.collections_deleted = len(deleted)
             state.collections.clear()
+            state.collection_ids.clear()
+            state.collection_owned.clear()
 
         state.save()
         if log:

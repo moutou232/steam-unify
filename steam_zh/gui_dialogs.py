@@ -13,11 +13,19 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import apply, category_model, category_state, scoring, service, ui_widgets
+from . import (
+    apply,
+    category_model,
+    category_state,
+    providers,
+    scoring,
+    service,
+    ui_widgets,
+)
 from .state import State
 from .translate import probe
 
-APP_TITLE = "Steam 统译 (Steam Unify)"
+APP_TITLE = "Steam 统译 v2.0 (Steam Unify)"
 BG = ui_widgets.BG
 PANEL = ui_widgets.PANEL
 PANEL2 = ui_widgets.PANEL2
@@ -41,7 +49,7 @@ SOURCE_LABEL = {
 }
 
 STATUS_FILTERS = [
-    "全部", "已翻译", "待翻译", "未分类", "已复原", "机翻", "官方/词典",
+    "全部", "已翻译", "待翻译", "待复原", "已复原", "已跳过", "未分类", "机翻", "官方/词典",
     "手动", "已应用", "已安装", "已拥有",
 ]
 
@@ -436,6 +444,85 @@ class BatchCategoryDialog(tk.Toplevel):
         self.destroy()
 
 
+class SourcePriorityDialog(tk.Toplevel):
+    def __init__(self, app, order: list[str], on_save):
+        super().__init__(app.root)
+        self.app = app
+        self.on_save = on_save
+        self.order = providers.normalize_priority_order(order)
+        self.title("参考源优先级")
+        self.configure(bg=BG)
+        self.geometry("560x500")
+        self.minsize(500, 420)
+        self.transient(app.root)
+        self.grab_set()
+        tk.Label(
+            self, text="手动选择（始终最高，不可调整）", bg=PANEL, fg=GREEN,
+            anchor="w", padx=14, pady=8,
+        ).pack(fill="x")
+        tk.Label(
+            self, text="靠前的来源有结果时优先使用；没有结果时自动使用下一个。",
+            bg=BG, fg=MUTED, anchor="w", padx=14, pady=4,
+        ).pack(fill="x")
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=14, pady=4)
+        self.lb = tk.Listbox(
+            body, bg=PANEL2, fg=FG, selectbackground="#2a475e",
+            selectforeground="#ffffff", relief="flat", activestyle="none",
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.lb.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.lb.yview)
+        self.lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._render()
+
+        buttons = tk.Frame(self, bg=BG)
+        buttons.pack(fill="x", padx=14, pady=4)
+        ttk.Button(buttons, text="上移", command=lambda: self._move(-1)).pack(side="left", padx=3)
+        ttk.Button(buttons, text="下移", command=lambda: self._move(1)).pack(side="left", padx=3)
+        ttk.Button(buttons, text="恢复默认", command=self._reset).pack(side="left", padx=3)
+        self.reselect_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            self, text="保存后按新顺序重选已有自动译名（不自动写入 Steam）",
+            variable=self.reselect_var, bg=BG, fg=FG, selectcolor=PANEL2,
+            activebackground=BG, activeforeground=FG, anchor="w",
+        ).pack(fill="x", padx=14, pady=4)
+        bottom = tk.Frame(self, bg=BG)
+        bottom.pack(fill="x", padx=14, pady=(4, 12))
+        ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right", padx=4)
+        ttk.Button(bottom, text="保存", style="Accent.TButton",
+                   command=self._save).pack(side="right", padx=4)
+
+    def _render(self):
+        self.lb.delete(0, "end")
+        for i, source in enumerate(self.order, 1):
+            self.lb.insert("end", f"{i}. {providers.LABELS.get(source, source)}")
+        if self.lb.size():
+            self.lb.selection_set(0)
+
+    def _move(self, delta: int):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        i = int(sel[0])
+        j = i + delta
+        if j < 0 or j >= len(self.order):
+            return
+        self.order[i], self.order[j] = self.order[j], self.order[i]
+        self._render()
+        self.lb.selection_set(j)
+        self.lb.see(j)
+
+    def _reset(self):
+        self.order = list(providers.DEFAULT_SOURCE_ORDER)
+        self._render()
+
+    def _save(self):
+        self.on_save(list(self.order), bool(self.reselect_var.get()))
+        self.destroy()
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
@@ -480,12 +567,47 @@ class SettingsDialog(tk.Toplevel):
                 selectcolor=PANEL2, activebackground=BG, activeforeground=FG,
             ).grid(row=r, column=0, columnspan=2, sticky="w", **pad)
             r += 1
+        self._source_priority = providers.normalize_priority_order(
+            s.get("source_priority")
+        )
+        self._reselect_priority = False
+        tk.Label(self, text="参考源优先级", bg=BG, fg=FG).grid(
+            row=r, column=0, sticky="w", **pad
+        )
+        priority_frame = tk.Frame(self, bg=BG)
+        priority_frame.grid(row=r, column=1, sticky="we", **pad)
+        self.priority_summary = tk.StringVar()
+        tk.Label(priority_frame, textvariable=self.priority_summary, bg=BG, fg=MUTED,
+                 anchor="w").pack(side="left", fill="x", expand=True)
+        ttk.Button(priority_frame, text="调整…", style="Small.TButton",
+                   command=self.open_source_priority).pack(side="right")
+        self._update_priority_summary()
+        r += 1
         tk.Label(self, text="备份保留数量", bg=BG, fg=FG).grid(row=r, column=0, sticky="w", **pad)
         self.vars["backup_keep"] = tk.IntVar(value=int(s.get("backup_keep", 10)))
         tk.Spinbox(
             self, from_=1, to=50, textvariable=self.vars["backup_keep"], width=6,
             bg=PANEL2, fg=FG, relief="flat",
         ).grid(row=r, column=1, sticky="w", **pad)
+        r += 1
+        tk.Label(self, text="启动窗口", bg=BG, fg=FG).grid(
+            row=r, column=0, sticky="nw", **pad
+        )
+        self.vars["window_mode"] = tk.StringVar(
+            value=str(s.get("window_mode") or "maximized")
+        )
+        win_frame = tk.Frame(self, bg=BG)
+        win_frame.grid(row=r, column=1, sticky="w", **pad)
+        for value, label in (
+            ("maximized", "最大化（默认，保留标题栏）"),
+            ("fullscreen", "无边框全屏"),
+            ("windowed", "窗口化（记住大小）"),
+        ):
+            tk.Radiobutton(
+                win_frame, text=label, value=value, variable=self.vars["window_mode"],
+                bg=BG, fg=FG, selectcolor=PANEL2, activebackground=BG,
+                activeforeground=FG,
+            ).pack(anchor="w")
         r += 1
         btns = tk.Frame(self, bg=BG)
         btns.grid(row=r, column=0, columnspan=2, sticky="e", pady=(10, 12), padx=10)
@@ -495,6 +617,18 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(btns, text="保存并重载", style="Accent.TButton", command=self.save).pack(
             side="left", padx=4
         )
+
+    def _update_priority_summary(self) -> None:
+        labels = [providers.LABELS.get(s, s) for s in self._source_priority[:4]]
+        self.priority_summary.set(" > ".join(labels) + (" > …" if len(self._source_priority) > 4 else ""))
+
+    def open_source_priority(self) -> None:
+        SourcePriorityDialog(self.app, self._source_priority, self._apply_priority)
+
+    def _apply_priority(self, order: list[str], reselect: bool) -> None:
+        self._source_priority = providers.normalize_priority_order(order)
+        self._reselect_priority = reselect
+        self._update_priority_summary()
 
     def open_backups(self) -> None:
         apply.BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -529,6 +663,8 @@ class SettingsDialog(tk.Toplevel):
             "restart_steam": bool(self.vars["restart_steam"].get()),
             "lock_appinfo": bool(self.vars["lock_appinfo"].get()),
             "backup_keep": int(self.vars["backup_keep"].get() or 10),
+            "window_mode": str(self.vars["window_mode"].get() or "maximized"),
+            "source_priority": list(self._source_priority),
         }
         old = dict(self.app.settings)
         self.app.settings.update(new)
@@ -536,6 +672,18 @@ class SettingsDialog(tk.Toplevel):
             self.app.ctx.state.save_settings(self.app.settings)
         else:
             State.load().save_settings(self.app.settings)
+        reselected = 0
+        if self._reselect_priority and self.app.ctx:
+            reselected = providers.reselect_cached_candidates(
+                self.app.ctx.state, self._source_priority
+            )
+            self.app.refresh_table()
+            self.app.refresh_sidebar()
+            self.app.refresh_inspector()
+            self.app.log(
+                f"已按新顺序重选 {reselected} 个自动译名；"
+                "点“应用名称”后才会写入 Steam"
+            )
         self.destroy()
         need_reload = any(
             old.get(k) != new.get(k)
@@ -545,3 +693,4 @@ class SettingsDialog(tk.Toplevel):
             self.app.reload()
         else:
             self.app.update_status()
+        self.app.apply_window_mode()
