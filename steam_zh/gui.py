@@ -1030,6 +1030,7 @@ class SteamZhApp:
                     ("progress", (i, n, f"翻译 {i}/{n}: {name}"))
                 ),
                 should_stop=lambda: self.cancel_flag,
+                log=lambda m: self.bus.put(("log", m)),
             )
 
         self.run_task("translate", work)
@@ -1352,6 +1353,7 @@ class SteamZhApp:
                 priority_order=self.settings.get("source_priority"),
                 progress=lambda i, n, name: self.bus.put(("progress", (i, n, f"翻译 {i}/{n}: {name}"))),
                 should_stop=lambda: self.cancel_flag,
+                log=lambda m: self.bus.put(("log", m)),
             )
             service.auto_categorize(self.ctx)
             return True
@@ -1467,7 +1469,7 @@ class SteamZhApp:
         header = tk.Frame(self.root, bg=PANEL, height=50)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        tk.Label(header, text="Steam 统译 v2.0.2", bg=PANEL, fg="#ffffff",
+        tk.Label(header, text="Steam 统译 v2.0.3", bg=PANEL, fg="#ffffff",
                  font=("Microsoft YaHei UI", 16, "bold")).pack(side="left", padx=16)
         tk.Label(header, text="翻译名称 / 分类整理 / 缓存级复原", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=4)
@@ -1756,7 +1758,7 @@ class SteamZhApp:
         messagebox.showinfo("使用说明", "README.md 位于程序目录。", parent=self.root)
 
     def _show_about(self):
-        messagebox.showinfo("关于", "Steam 统译 v2.0.2\n游戏名汉化 / 多标签分类 / 缓存级复原",
+        messagebox.showinfo("关于", "Steam 统译 v2.0.3\n游戏名汉化 / 多标签分类 / 缓存级复原",
                             parent=self.root)
 
 

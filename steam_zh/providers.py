@@ -416,6 +416,14 @@ def _fetch_xiaoheihe(game: GameInfo, proxy: str | None, timeout: float) -> dict[
             "candidate": None, "url": share_url}
 
 
+def _fetch_steam_china(game: GameInfo, proxy: str | None, timeout: float) -> dict[str, Any]:
+    url = f"https://store.steampowered.com/app/{game.appid}/"
+    name = translate.steam_china(game.appid, proxy)
+    if name:
+        return {"status": "ok", "candidate": {"name": name, "url": url}, "url": url}
+    return {"status": "no-result", "candidate": None, "url": url}
+
+
 def _fetch_steam_store(game: GameInfo, proxy: str | None, timeout: float) -> dict[str, Any]:
     url = f"https://store.steampowered.com/app/{game.appid}/"
     name = translate.steam_store(game.appid, proxy)
@@ -449,6 +457,7 @@ PROVIDER_FUNCS: dict[str, Callable] = {
     "3dm": _fetch_3dm,
     "xiaoheihe": _fetch_xiaoheihe,
     "steam_store": _fetch_steam_store,
+    "steam_china": _fetch_steam_china,
     "mymemory": _fetch_mymemory,
 }
 
@@ -614,6 +623,65 @@ def candidate_dicts(resolution: NameResolution) -> list[dict[str, Any]]:
     return [c.as_dict() for c in resolution.candidates]
 
 
+def fetch_source_candidate(
+    game: GameInfo,
+    source: str,
+    *,
+    network: bool = True,
+    proxy: str | None = None,
+    timeout: float = 5.0,
+    dictionary: dict[str, str] | None = None,
+) -> tuple[str, NameCandidate | None]:
+    """Fetch one source for one game.  Used by phase-ordered translation."""
+    if source == "steam_official":
+        raw = game.official_zh or (game.name if game.has_cjk else "")
+        candidate = _make_candidate(
+            "steam_official", game, raw,
+            f"https://store.steampowered.com/app/{game.appid}/",
+            "appinfo name_localized" if game.official_zh else "原名已是中文",
+        )
+        return ("ok" if candidate else "no-result", candidate)
+    if source == "dictionary":
+        dictionary = dictionary if dictionary is not None else translate.load_dictionary()
+        candidate = _make_candidate(
+            "dictionary", game, dictionary.get(str(game.appid), ""), "", "内置词典"
+        )
+        return ("ok" if candidate else "no-result", candidate)
+    if not network:
+        return "network-disabled", None
+    if source not in PROVIDER_FUNCS:
+        return "unsupported", None
+
+    cached = _cache_get(game.appid, "name", source)
+    if cached:
+        payload = cached.get("candidate")
+        status = str(cached.get("status") or "")
+        if isinstance(payload, dict) and payload.get("name"):
+            candidate = _make_candidate(
+                source, game, str(payload["name"]),
+                str(cached.get("url") or payload.get("url") or ""),
+                LABELS.get(source, source),
+            )
+            return ("ok" if candidate else "no-cjk"), candidate
+        return status or "no-result", None
+
+    try:
+        result = PROVIDER_FUNCS[source](game, proxy, timeout)
+    except Exception as exc:
+        result = {"status": type(exc).__name__, "candidate": None, "url": ""}
+    _cache_put(game.appid, "name", source, result)
+    status = str(result.get("status") or "")
+    payload = result.get("candidate")
+    if isinstance(payload, dict) and payload.get("name"):
+        candidate = _make_candidate(
+            source, game, str(payload["name"]),
+            str(result.get("url") or payload.get("url") or ""),
+            LABELS.get(source, source),
+        )
+        return ("ok" if candidate else "no-cjk"), candidate
+    return status or "no-result", None
+
+
 def translate_games_v2(
     games: list[GameInfo],
     state: State,
@@ -625,17 +693,18 @@ def translate_games_v2(
     timeout: float = 5.0,
     force: bool = False,
     priority_order: list[str] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> dict[int, str]:
-    """Resolve candidates for missing names and persist the selected one.
+    """Resolve names source-by-source in the user's priority order.
 
-    Saves state every 20 games, not after every game.
+    Source-major batching is deliberate: every source gets a full pass over the
+    games that are still unresolved, so one slow/parallel source cannot starve
+    the others.  Once a game gets a candidate, lower-priority sources are not
+    queried for that game.
     """
     status: dict[int, str] = {}
-    total = len(games)
-    dirty = 0
-    for i, game in enumerate(games, 1):
-        if should_stop and should_stop():
-            break
+    eligible: list[GameInfo] = []
+    for game in games:
         rec = state.get_app(game.appid)
         if rec.get("skipped"):
             status[game.appid] = "skipped"
@@ -646,33 +715,130 @@ def translate_games_v2(
         if rec.get("zh_name") and not force and str(rec.get("source") or "") not in ("", "original"):
             status[game.appid] = str(rec.get("source") or "existing")
             continue
-        resolution = fetch_name_candidates(
-            game, network=use_network, proxy=proxy, timeout=timeout,
-            priority_order=priority_order,
-        )
-        rec["name_candidates"] = candidate_dicts(resolution)
-        rec["name_provider_errors"] = list(resolution.errors)
-        if resolution.selected:
-            c = resolution.selected
-            rec["zh_name"] = c.name
-            rec["source"] = c.source
-            rec["detail"] = c.detail or LABELS.get(c.source, c.source)
-            rec["source_url"] = c.url
-            rec["name_selected_source"] = c.source
-            rec["name_confidence"] = c.confidence
+        eligible.append(game)
+    if not eligible:
+        return status
+
+    dictionary = translate.load_dictionary()
+    order = normalize_priority_order(priority_order)
+    resolved: set[int] = set()
+    errors_by_appid: dict[int, list[str]] = {}
+    source_hits: dict[str, int] = {}
+    interrupted = False
+    dirty = 0
+    if log:
+        log("自动翻译开始：按优先级逐来源检索："
+            + " → ".join(LABELS.get(s, s) for s in order))
+
+    for index, source in enumerate(order, 1):
+        pending = [g for g in eligible if g.appid not in resolved]
+        if not pending:
+            break
+        if should_stop and should_stop():
+            interrupted = True
+            break
+        label = LABELS.get(source, source)
+        if source not in ("steam_official", "dictionary") and not use_network:
+            if log:
+                log(f"[{index}/{len(order)}] {label}：已跳过（未启用联网）")
+            continue
+        if source not in ("steam_official", "dictionary") and source not in PROVIDER_FUNCS:
+            if log:
+                log(f"[{index}/{len(order)}] {label}：无可用接口，已跳过")
+            continue
+        if log:
+            log(f"[{index}/{len(order)}] {label}：待查 {len(pending)} 个游戏")
+
+        results: dict[int, NameCandidate] = {}
+        failures = 0
+        completed = 0
+
+        def fetch_one(game: GameInfo) -> tuple[int, str, NameCandidate | None]:
+            if should_stop and should_stop():
+                return game.appid, "cancelled", None
+            code, candidate = fetch_source_candidate(
+                game, source, network=use_network, proxy=proxy,
+                timeout=timeout, dictionary=dictionary,
+            )
+            return game.appid, code, candidate
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_one, g): g for g in pending}
+            try:
+                for future in as_completed(futures):
+                    game = futures[future]
+                    try:
+                        appid, code, candidate = future.result()
+                    except Exception as exc:
+                        appid, code, candidate = game.appid, type(exc).__name__, None
+                    completed += 1
+                    if candidate is not None:
+                        results[appid] = candidate
+                    else:
+                        code_text = code or "no-result"
+                        errors_by_appid.setdefault(appid, []).append(f"{source}: {code_text}")
+                        if code_text not in ("no-result", "no-cjk", "network-disabled"):
+                            failures += 1
+                    if progress:
+                        progress(completed, len(pending), f"{label} {completed}/{len(pending)}")
+                    if log and (completed % 25 == 0 or completed == len(pending)):
+                        log(f"[{index}/{len(order)}] {label}：已处理 "
+                            f"{completed}/{len(pending)}，命中 {len(results)}")
+                    if should_stop and should_stop():
+                        interrupted = True
+                        for f in futures:
+                            f.cancel()
+                        break
+            finally:
+                for f in futures:
+                    f.cancel()
+
+        for game in pending:
+            candidate = results.get(game.appid)
+            if candidate is None:
+                continue
+            rec = state.get_app(game.appid)
+            rec["zh_name"] = candidate.name
+            rec["source"] = candidate.source
+            rec["detail"] = candidate.detail or LABELS.get(candidate.source, candidate.source)
+            rec["source_url"] = candidate.url
+            rec["name_selected_source"] = candidate.source
+            rec["name_confidence"] = candidate.confidence
             rec["name_selected_by"] = "auto"
+            rec["name_candidates"] = [candidate.as_dict()]
+            rec["name_provider_errors"] = list(errors_by_appid.get(game.appid, []))
             rec["error"] = ""
-            status[game.appid] = c.source
-        else:
-            rec["error"] = "所有来源均未找到中文名，请手动填写"
-            status[game.appid] = "missing"
-        dirty += 1
+            status[game.appid] = candidate.source
+            resolved.add(game.appid)
+            dirty += 1
+        source_hits[source] = len(results)
+        if log:
+            log(f"[{index}/{len(order)}] {label}：完成，命中 {len(results)}，"
+                f"剩余 {len(pending) - len(results)}，失败 {failures}")
         if dirty >= 20:
             state.save()
             dirty = 0
-        if progress:
-            progress(i, total, game.name)
+        if interrupted:
+            break
+
+    if not interrupted:
+        for game in eligible:
+            if game.appid in resolved:
+                continue
+            rec = state.get_app(game.appid)
+            rec["error"] = "所有来源均未找到中文名，请手动填写"
+            rec["name_provider_errors"] = list(errors_by_appid.get(game.appid, []))
+            status[game.appid] = "missing"
     state.save()
+    if log:
+        remaining = sum(1 for g in eligible if g.appid not in resolved)
+        hits = "，".join(
+            f"{LABELS.get(s, s)} {n}" for s, n in source_hits.items() if n
+        ) or "无"
+        if interrupted:
+            log(f"自动翻译已取消：已命中 {len(resolved)}，未完成 {remaining}")
+        else:
+            log(f"自动翻译完成：{hits}；未找到 {remaining}")
     return status
 
 

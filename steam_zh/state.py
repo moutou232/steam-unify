@@ -15,7 +15,7 @@ DATA_DIR = paths.data_dir()
 STATE_PATH = DATA_DIR / "state.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {

@@ -234,6 +234,7 @@ def auto_translate(
     should_stop: Callable[[], bool] | None = None,
     games: list[GameInfo] | None = None,
     priority_order: list[str] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> dict[int, str]:
     return providers.translate_games_v2(
         games if games is not None else ctx.games,
@@ -243,6 +244,7 @@ def auto_translate(
         progress=progress,
         should_stop=should_stop,
         priority_order=priority_order,
+        log=log,
     )
 
 
