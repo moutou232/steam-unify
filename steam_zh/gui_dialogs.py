@@ -25,7 +25,7 @@ from . import (
 from .state import State
 from .translate import probe
 
-APP_TITLE = "Steam 统译 v2.0.4 (Steam Unify)"
+APP_TITLE = "Steam 统译 v2.0.5 (Steam Unify)"
 BG = ui_widgets.BG
 PANEL = ui_widgets.PANEL
 PANEL2 = ui_widgets.PANEL2

@@ -1194,7 +1194,10 @@ class SteamZhApp:
         if mode in ("categories", "both"):
             lines.append(f"将清空分类：{categories}")
             lines.append(f"将删除分类收藏集：{collections_count}")
-            lines.append("  收藏夹、已隐藏和智能过滤收藏集保留")
+            lines.append("  注意：将清除所有分类收藏集（包括非本程序创建的）。")
+            lines.append("  这会让所有游戏变为未分类状态。")
+            lines.append("  收藏夹、已隐藏和智能过滤收藏集保留。")
+            lines.append("  若只需要删去部分收藏集，请直接在 Steam 中进行操作。")
         if unknown and mode != "categories":
             lines.append(f"原名未知、将跳过：{unknown}")
         lines += ["", "操作前会自动完整备份。", "此操作会修改 Steam 本地数据。", "", "确定继续？"]
@@ -1463,7 +1466,7 @@ class SteamZhApp:
         header = tk.Frame(self.root, bg=PANEL, height=50)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        tk.Label(header, text="Steam 统译 v2.0.4", bg=PANEL, fg="#ffffff",
+        tk.Label(header, text="Steam 统译 v2.0.5", bg=PANEL, fg="#ffffff",
                  font=("Microsoft YaHei UI", 16, "bold")).pack(side="left", padx=16)
         tk.Label(header, text="翻译名称 / 分类整理 / 缓存级复原", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=4)
@@ -1612,21 +1615,19 @@ class SteamZhApp:
                 b.pack(side="left", padx=(0, 6)); self.buttons[key] = b
         make("names", [
             ("auto_translate", "自动翻译", self.on_translate, "Primary.TButton"),
-            ("apply_names", "应用名称", lambda: self.on_apply(False, "names"), ""),
-            ("apply_sel_names", "应用选中", lambda: self.on_apply(True, "names"), ""),
+            ("apply_names", "应用全部名称", lambda: self.on_apply(False, "names"), ""),
+            ("apply_sel_names", "应用选中名称", lambda: self.on_apply(True, "names"), ""),
         ])
         make("categories", [
             ("auto_categories", "自动分类", self.on_categorize, "Primary.TButton"),
             ("batch", "批量分类", self.on_batch, ""),
-            ("apply_categories", "应用分类", lambda: self.on_apply(False, "categories"), ""),
-            ("apply_sel_categories", "应用选中", lambda: self.on_apply(True, "categories"), ""),
+            ("apply_categories", "应用全部分类", lambda: self.on_apply(False, "categories"), ""),
+            ("apply_sel_categories", "应用选中分类", lambda: self.on_apply(True, "categories"), ""),
             ("undo_batch", "撤销批量", self.on_undo_batch, ""),
         ])
         make("both", [
-            ("auto_translate", "自动翻译", self.on_translate, "Primary.TButton"),
-            ("auto_categories", "自动分类", self.on_categorize, ""),
-            ("apply_all", "应用全部", lambda: self.on_apply(False, "both"), "Primary.TButton"),
-            ("apply_sel_all", "应用选中", lambda: self.on_apply(True, "both"), ""),
+            ("apply_all", "应用全部名称及分类", lambda: self.on_apply(False, "both"), "Primary.TButton"),
+            ("apply_sel_all", "应用选中的名称及分类", lambda: self.on_apply(True, "both"), ""),
         ])
         right = tk.Frame(parent, bg=BG); right.pack(side="right")
         tools = ttk.Menubutton(right, text="⚙ 工具", style="Tool.TMenubutton")
@@ -1642,7 +1643,7 @@ class SteamZhApp:
         tm.add_command(label="补全简介", command=self.on_fetch_descriptions)
         tm.add_separator(); tm.add_command(label="设置", command=self.on_settings)
         tools.configure(menu=tm); self.tool_menu = tm
-        danger = ttk.Menubutton(right, text="⚠ 危险", style="Tool.TMenubutton")
+        danger = ttk.Menubutton(right, text="⚠ 复原", style="Tool.TMenubutton")
         danger.pack(side="left")
         dm = tk.Menu(danger, tearoff=0, bg=PANEL2, fg=FG,
                      activebackground="#7d2b2b", activeforeground="#ffffff")
@@ -1752,7 +1753,7 @@ class SteamZhApp:
         messagebox.showinfo("使用说明", "README.md 位于程序目录。", parent=self.root)
 
     def _show_about(self):
-        messagebox.showinfo("关于", "Steam 统译 v2.0.4\n游戏名汉化 / 多标签分类 / 缓存级复原",
+        messagebox.showinfo("关于", "Steam 统译 v2.0.5\n游戏名汉化 / 多标签分类 / 缓存级复原",
                             parent=self.root)
 
 
