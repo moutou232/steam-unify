@@ -15,14 +15,14 @@ DATA_DIR = paths.data_dir()
 STATE_PATH = DATA_DIR / "state.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "steam_root": "",
     "account": "",
     "use_network": True,
-    "auto_translate_new": True,
+    "auto_translate_new": False,
     "proxy": "",
     "include_software": False,
     "all_known": True,

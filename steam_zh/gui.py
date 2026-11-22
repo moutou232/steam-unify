@@ -579,13 +579,6 @@ class SteamZhApp:
         if name == "load":
             self.ctx = result
             self.games_by_id = {g.appid: g for g in self.ctx.games}
-            try:
-                service.auto_translate(
-                    self.ctx, use_network=False,
-                    priority_order=self.settings.get("source_priority"),
-                )
-            except Exception as exc:
-                self._append_log(f"内置名称填充失败：{exc}")
             self.refresh_table()
             self.refresh_sidebar()
             self._append_log(
@@ -596,6 +589,7 @@ class SteamZhApp:
                 self._append_log(f"缓存警告：{warning}")
             self.update_status()
             self._append_log("已跳过启动时自动获取原名；需要时请点“工具 → 补全原名”。")
+            self._append_log("扫描完成，不会自动翻译；需要时请点击“自动翻译”。")
             self._maybe_auto_translate_new()
         elif name == "auto_new_translate":
             service.auto_categorize(self.ctx)
@@ -1469,7 +1463,7 @@ class SteamZhApp:
         header = tk.Frame(self.root, bg=PANEL, height=50)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        tk.Label(header, text="Steam 统译 v2.0.3", bg=PANEL, fg="#ffffff",
+        tk.Label(header, text="Steam 统译 v2.0.4", bg=PANEL, fg="#ffffff",
                  font=("Microsoft YaHei UI", 16, "bold")).pack(side="left", padx=16)
         tk.Label(header, text="翻译名称 / 分类整理 / 缓存级复原", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=4)
@@ -1758,7 +1752,7 @@ class SteamZhApp:
         messagebox.showinfo("使用说明", "README.md 位于程序目录。", parent=self.root)
 
     def _show_about(self):
-        messagebox.showinfo("关于", "Steam 统译 v2.0.3\n游戏名汉化 / 多标签分类 / 缓存级复原",
+        messagebox.showinfo("关于", "Steam 统译 v2.0.4\n游戏名汉化 / 多标签分类 / 缓存级复原",
                             parent=self.root)
 
 

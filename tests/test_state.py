@@ -35,9 +35,36 @@ class StateTests(unittest.TestCase):
 
     def test_default_settings_show_all_known_and_xiaoheihe_first(self):
         self.assertTrue(state_module.DEFAULT_SETTINGS["all_known"])
+        self.assertFalse(state_module.DEFAULT_SETTINGS["auto_translate_new"])
         self.assertEqual(
             state_module.DEFAULT_SETTINGS["source_priority"][0], "xiaoheihe"
         )
+
+    def test_fresh_state_has_no_translated_names(self):
+        st = State()
+        g = GameInfo(appid=3, name="Fresh Game", type="Game")
+        st.merge_games([g])
+        rec = st.get_app(3)
+        self.assertEqual(rec["zh_name"], "")
+        self.assertEqual(rec["source"], "")
+        self.assertFalse(rec["applied"])
+        self.assertEqual(rec["categories"], [])
+
+    def test_existing_translation_is_preserved(self):
+        st = State()
+        st.set_app(4, zh_name="已有中文名", source="manual", applied=True)
+        g = GameInfo(appid=4, name="Existing Game", type="Game")
+        st.merge_games([g])
+        self.assertEqual(st.get_app(4)["zh_name"], "已有中文名")
+        self.assertTrue(st.get_app(4)["applied"])
+
+    def test_explicit_auto_translate_true_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "settings.json"
+            path.write_text(json.dumps({"auto_translate_new": True}), encoding="utf-8")
+            with mock.patch.object(state_module, "SETTINGS_PATH", path):
+                loaded = State.load_settings()
+            self.assertTrue(loaded["auto_translate_new"])
 
     def test_old_default_source_priority_is_migrated(self):
         with tempfile.TemporaryDirectory() as td:
