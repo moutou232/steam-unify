@@ -15,7 +15,7 @@ DATA_DIR = paths.data_dir()
 STATE_PATH = DATA_DIR / "state.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.0.2"
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -32,16 +32,27 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "window_mode": "maximized",
     "window_geometry": "",
     "source_priority": [
+        "xiaoheihe",
         "steam_official",
         "dictionary",
         "steam_store",
-        "xiaoheihe",
         "3dm",
         "steam_china",
         "steamdb",
         "mymemory",
     ],
 }
+
+OLD_SOURCE_PRIORITY = [
+    "steam_official",
+    "dictionary",
+    "steam_store",
+    "xiaoheihe",
+    "3dm",
+    "steam_china",
+    "steamdb",
+    "mymemory",
+]
 
 
 def _load(path: Path, default: Any) -> Any:
@@ -218,8 +229,15 @@ class State:
 
     @staticmethod
     def load_settings() -> dict[str, Any]:
+        raw = _load(SETTINGS_PATH, {})
+        if not isinstance(raw, dict):
+            raw = {}
         data = dict(DEFAULT_SETTINGS)
-        data.update(_load(SETTINGS_PATH, {}))
+        data.update(raw)
+        # Migrate only the exact old default order.  A user-customized order
+        # must never be overwritten.
+        if raw.get("source_priority") == OLD_SOURCE_PRIORITY:
+            data["source_priority"] = list(DEFAULT_SETTINGS["source_priority"])
         return data
 
 

@@ -66,17 +66,14 @@ class XiaoheiheFetchTests(unittest.TestCase):
         finally:
             providers._MEMORY_CACHE = old
 
-    def test_priority_is_just_below_steam_store(self):
-        self.assertLess(providers.PRIORITY["xiaoheihe"], providers.PRIORITY["steam_store"])
-        self.assertGreater(providers.PRIORITY["xiaoheihe"], providers.PRIORITY["3dm"])
-        store = providers._make_candidate("steam_store", game(), "哈迪斯")
-        xhh = providers._make_candidate("xiaoheihe", game(), "哈迪斯")
-        three = providers._make_candidate("3dm", game(), "哈迪斯")
-        self.assertIsNotNone(store)
-        self.assertIsNotNone(xhh)
-        self.assertIsNotNone(three)
-        self.assertGreater(store.score, xhh.score)
-        self.assertGreater(xhh.score, three.score)
+    def test_default_source_order_puts_xiaoheihe_first(self):
+        self.assertEqual(providers.DEFAULT_SOURCE_ORDER[0], "xiaoheihe")
+        items = [
+            providers.NameCandidate("steam_store", "商店名", 0.92),
+            providers.NameCandidate("xiaoheihe", "黑盒名", 0.90),
+        ]
+        ordered = providers.order_name_candidates(items)
+        self.assertEqual(ordered[0].source, "xiaoheihe")
 
 
 if __name__ == "__main__":

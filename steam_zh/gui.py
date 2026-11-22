@@ -595,7 +595,7 @@ class SteamZhApp:
             for warning in getattr(self.ctx, "warnings", [])[:5]:
                 self._append_log(f"缓存警告：{warning}")
             self.update_status()
-            self._start_originals_fetch()
+            self._append_log("已跳过启动时自动获取原名；需要时请点“工具 → 补全原名”。")
             self._maybe_auto_translate_new()
         elif name == "auto_new_translate":
             service.auto_categorize(self.ctx)
@@ -1097,6 +1097,26 @@ class SteamZhApp:
         if not targets:
             messagebox.showinfo("提示", empty, parent=self.root)
             return
+        if mode in ("names", "both"):
+            missing_orig = [
+                g for g in targets
+                if not bool(self.ctx.state.get_app(g.appid).get("orig_verified"))
+            ]
+            if missing_orig:
+                choice = messagebox.askyesnocancel(
+                    "原名未补全",
+                    f"有 {len(missing_orig)} 个游戏尚未补全原名。\n"
+                    "如果现在应用名称，后悔药将无法恢复这些名称。\n\n"
+                    "是否先补全原名？\n"
+                    "选择“是”会先补全，然后请你重新点击应用；"
+                    "选择“否”仍然应用；选择“取消”返回。",
+                    parent=self.root,
+                )
+                if choice is None:
+                    return
+                if choice:
+                    self._start_originals_fetch(force=True)
+                    return
         what = {"names": "中文名", "categories": "分类收藏集", "both": "名称和分类"}[mode]
         if not messagebox.askyesno(
             "应用更改",
@@ -1447,7 +1467,7 @@ class SteamZhApp:
         header = tk.Frame(self.root, bg=PANEL, height=50)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        tk.Label(header, text="Steam 统译 v2.0", bg=PANEL, fg="#ffffff",
+        tk.Label(header, text="Steam 统译 v2.0.2", bg=PANEL, fg="#ffffff",
                  font=("Microsoft YaHei UI", 16, "bold")).pack(side="left", padx=16)
         tk.Label(header, text="翻译名称 / 分类整理 / 缓存级复原", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=4)
@@ -1736,7 +1756,7 @@ class SteamZhApp:
         messagebox.showinfo("使用说明", "README.md 位于程序目录。", parent=self.root)
 
     def _show_about(self):
-        messagebox.showinfo("关于", "Steam 统译 v2.0\n游戏名汉化 / 多标签分类 / 缓存级复原",
+        messagebox.showinfo("关于", "Steam 统译 v2.0.2\n游戏名汉化 / 多标签分类 / 缓存级复原",
                             parent=self.root)
 
 

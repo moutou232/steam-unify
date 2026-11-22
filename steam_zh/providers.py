@@ -64,10 +64,10 @@ LABELS = {
 }
 
 DEFAULT_SOURCE_ORDER = [
+    "xiaoheihe",
     "steam_official",
     "dictionary",
     "steam_store",
-    "xiaoheihe",
     "3dm",
     "steam_china",
     "steamdb",
@@ -479,15 +479,8 @@ def order_name_candidates(
     priority_order: list[str] | None = None,
 ) -> list[NameCandidate]:
     """Order candidates by the user's source priority, then confidence."""
-    if not priority_order:
-        by_name: dict[str, NameCandidate] = {}
-        for c in candidates:
-            key = c.name.casefold()
-            old = by_name.get(key)
-            if old is None or c.score > old.score:
-                by_name[key] = c
-        return sorted(by_name.values(), key=lambda c: (-c.score, -c.confidence,
-                                                       -PRIORITY.get(c.source, 0)))
+    if priority_order is None:
+        priority_order = DEFAULT_SOURCE_ORDER
     order = normalize_priority_order(priority_order)
     rank = _priority_rank(order)
 

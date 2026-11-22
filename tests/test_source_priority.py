@@ -19,10 +19,9 @@ class PriorityTests(unittest.TestCase):
         self.assertEqual(set(order), set(providers.DEFAULT_SOURCE_ORDER))
 
     def test_normalize_empty_uses_default(self):
-        self.assertEqual(
-            providers.normalize_priority_order([]),
-            providers.DEFAULT_SOURCE_ORDER,
-        )
+        order = providers.normalize_priority_order([])
+        self.assertEqual(order, providers.DEFAULT_SOURCE_ORDER)
+        self.assertEqual(order[0], "xiaoheihe")
 
     def test_user_order_wins(self):
         items = [
