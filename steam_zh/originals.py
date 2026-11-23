@@ -361,13 +361,23 @@ def prepare_undo(
     should_stop: Callable[[], bool] | None = None,
 ) -> UndoPreparation:
     """Resolve Chinese-store names for the state and every Chinese appinfo entry."""
-    cache_info = cache.AppInfoCache.detect(env).require()
-    shards = cache_info.load_shards()
+    cache_info = cache.AppInfoCache.detect(env)
+    root = getattr(env, "root", None)
+    cache_info = cache_info.require(root) if root is not None else cache_info.require()
     live: dict[int, str] = {}
-    for appid in shards.appids:
-        name = str(shards.get_name(appid) or "").strip()
-        if name:
-            live[appid] = name
+    kind = getattr(cache_info, "kind", cache.CacheKind.SHARDS)
+    if kind == cache.CacheKind.SHARDS:
+        shards = cache_info.load_shards()
+        for appid in shards.appids:
+            name = str(shards.get_name(appid) or "").strip()
+            if name:
+                live[appid] = name
+    else:
+        app_info = cache_info.load_appinfo()
+        for entry in app_info.entries:
+            name = str(app_info.get_name(entry.appid) or "").strip()
+            if name:
+                live[entry.appid] = name
     result = UndoPreparation()
     candidates: set[int] = set()
 

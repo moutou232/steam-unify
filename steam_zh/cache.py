@@ -47,9 +47,9 @@ class AppInfoCache:
     def detect(cls, env: steamenv.SteamEnv, wait: float = 0.0) -> "AppInfoCache":
         deadline = time.monotonic() + max(0.0, wait)
         while True:
-            shard_dir = env.shard_dir
-            if shard_dir.is_dir() and any(shard_dir.glob("appinfo_*.vdf")):
-                return cls(CacheKind.SHARDS, shard_dir=shard_dir)
+            # Steam v30 still treats an existing monolithic appinfo.vdf as
+            # authoritative: it reads that file, regenerates the shards, and
+            # deletes the old file.  Prefer it when both layouts exist.
             candidates = [
                 env.root / "appcache" / "appinfo.vdf",
                 env.root / "steamapps" / "appinfo.vdf",
@@ -57,6 +57,9 @@ class AppInfoCache:
             for path in candidates:
                 if path.is_file():
                     return cls(CacheKind.MONOLITHIC, appinfo_path=path)
+            shard_dir = env.shard_dir
+            if shard_dir.is_dir() and any(shard_dir.glob("appinfo_*.vdf")):
+                return cls(CacheKind.SHARDS, shard_dir=shard_dir)
             if time.monotonic() >= deadline:
                 return cls(CacheKind.MISSING)
             time.sleep(0.25)
@@ -159,3 +162,26 @@ def detect_for_context(
                 "没有找到 appinfo 缓存；如果 Steam 正在启动，请稍后重试。"
             )
     return cache
+
+
+def diagnostic(env: steamenv.SteamEnv) -> str:
+    mono = env.root / "appcache" / "appinfo.vdf"
+    alt = env.root / "steamapps" / "appinfo.vdf"
+    shard_dir = env.shard_dir
+    shards = list(shard_dir.glob("appinfo_*.vdf")) if shard_dir.is_dir() else []
+    chosen = AppInfoCache.detect(env)
+    def state(path: Path) -> str:
+        if not path.is_file():
+            return "不存在"
+        try:
+            st = path.stat()
+            return f"存在，{st.st_size} bytes，{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime))}"
+        except OSError:
+            return "存在，无法读取属性"
+    return (
+        "缓存诊断：\n"
+        f"- appcache/appinfo.vdf：{state(mono)}\n"
+        f"- steamapps/appinfo.vdf：{state(alt)}\n"
+        f"- shards：{len(shards)} 个（{shard_dir}）\n"
+        f"- 本次将使用：{chosen.describe()}"
+    )

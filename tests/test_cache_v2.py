@@ -20,12 +20,12 @@ def _root(tmp: Path, *, shards: bool = False, monolithic: bool = False) -> Steam
 
 
 class CacheLayoutTests(unittest.TestCase):
-    def test_shards_preferred(self):
+    def test_monolithic_is_authoritative_when_both_exist(self):
         with tempfile.TemporaryDirectory() as td:
             env = _root(Path(td), shards=True, monolithic=True)
             got = cache.AppInfoCache.detect(env)
-            self.assertEqual(got.kind, cache.CacheKind.SHARDS)
-            self.assertFalse(got.appinfo_path)
+            self.assertEqual(got.kind, cache.CacheKind.MONOLITHIC)
+            self.assertTrue(got.appinfo_path and got.appinfo_path.is_file())
 
     def test_monolithic(self):
         with tempfile.TemporaryDirectory() as td:

@@ -65,9 +65,11 @@ def preflight_writable(env: steamenv.SteamEnv, *, include_appinfo: bool = True) 
     """Fail before closing Steam if any target directory is not writable."""
     targets: list[Path] = []
     if include_appinfo:
+        if env.appinfo.is_file():
+            targets.append(env.appinfo.parent)
         if env.has_shards:
             targets.append(env.shard_dir)
-        else:
+        if not env.appinfo.is_file() and not env.has_shards:
             targets.append(env.appinfo.parent)
     targets += [env.cloudstorage]
     for info in steamenv.installed_apps(env.root).values():
@@ -279,6 +281,8 @@ def apply_changes(
     cache_info = cache.AppInfoCache.detect(env)
     if need_appinfo:
         cache_info.require(env.root)
+    if log and need_appinfo:
+        log(cache.diagnostic(env))
     snapshot = cache.CacheSnapshot.capture(cache_info) if need_appinfo else None
     preflight_writable(env, include_appinfo=need_appinfo)
     was_running = steamenv.steam_running()
@@ -461,6 +465,8 @@ def verify(
     cache_info = cache.AppInfoCache.detect(env, wait=15.0)
     if cache_info.kind == cache.CacheKind.MISSING:
         result.warnings.append("校验时未找到 appinfo 缓存，稍后重新扫描即可")
+        if log:
+            log(cache.diagnostic(env))
         return result
     ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
     ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
