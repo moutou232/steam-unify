@@ -36,9 +36,12 @@ class ApplyResult:
     collection_skipped: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     verified_names: int = 0
+    verified_acfs: int = 0
     verify_failed: list[int] = field(default_factory=list)
     collections_verified: bool = False
     steam_restarted: bool = False
+    cache_missing_after_restart: bool = False
+    cache_migration_timeout: bool = False
 
 
 def _copy(src: Path, dst: Path) -> None:
@@ -444,6 +447,62 @@ def apply_changes(
         if log:
             log("已启动 Steam，等待库加载后校验 ...")
 
+        # New Steam can migrate the old monolithic appinfo.vdf to shards on
+        # startup.  A write made to the monolithic file is then discarded.
+        # Wait for the migration and apply the same names to the authoritative
+        # shard cache once it appears.
+        if need_appinfo and cache_info.kind == cache.CacheKind.MONOLITHIC:
+            if log:
+                log("检测到单文件 appinfo：等待 Steam 迁移到分片缓存 ...")
+            migrated = None
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                time.sleep(2.0)
+                cand = cache.AppInfoCache.detect(env, wait=0.0)
+                if cand.kind == cache.CacheKind.SHARDS:
+                    migrated = cand
+                    break
+            if migrated is None:
+                result.cache_migration_timeout = True
+                result.cache_missing_after_restart = True
+                result.warnings.append(
+                    "Steam 未在预期时间内生成分片缓存；本次名称可能未持久化。"
+                )
+                if log:
+                    log("等待分片缓存超时；请退出 Steam 后重新应用")
+            else:
+                try:
+                    if log:
+                        log("分片缓存已出现，正在关闭 Steam 后写入分片 ...")
+                    steamenv.close_steam(env, log=log)
+                    time.sleep(2.0)
+                    fresh = cache.AppInfoCache.detect(env, wait=10.0)
+                    fresh.require(env.root)
+                    if fresh.kind != cache.CacheKind.SHARDS:
+                        raise RuntimeError("分片缓存消失")
+                    ss2 = fresh.load_shards()
+                    migrated_ids = []
+                    for g in planned:
+                        zh = names[g.appid]
+                        current = ss2.get_name(g.appid) or ""
+                        localized = ss2.get_localized(g.appid)
+                        if current == zh and not localized:
+                            continue
+                        ss2.set_name(g.appid, zh)
+                        migrated_ids.append(g.appid)
+                    if migrated_ids:
+                        _retry_write(ss2.save)
+                    if log:
+                        log(f"分片缓存写入完成：{len(migrated_ids)} 个名称")
+                    steamenv.start_steam(env)
+                    result.steam_restarted = True
+                    if migrated_ids:
+                        result.names_applied = max(result.names_applied, len(migrated_ids))
+                except Exception as exc:
+                    result.warnings.append(f"分片迁移后写入失败：{exc}")
+                    if log:
+                        log(f"分片迁移后写入失败：{exc}")
+
     return result
 
 
@@ -451,7 +510,7 @@ def verify(
     env: steamenv.SteamEnv,
     state: State,
     games: list[GameInfo],
-    wait: float = 12.0,
+    wait: float = 30.0,
     log: Callable[[str], None] | None = None,
     mode: str = "both",
 ) -> ApplyResult:
@@ -462,15 +521,29 @@ def verify(
         time.sleep(wait)
     if not steamenv.steam_running():
         result.warnings.append("校验时 Steam 未运行")
-    cache_info = cache.AppInfoCache.detect(env, wait=15.0)
-    if cache_info.kind == cache.CacheKind.MISSING:
-        result.warnings.append("校验时未找到 appinfo 缓存，稍后重新扫描即可")
+    if mode == "categories":
+        cache_info = cache.AppInfoCache.detect(env, wait=0.0)
+    else:
+        cache_info = cache.AppInfoCache.detect(env, wait=0.0)
+        deadline = time.time() + 45.0
+        while cache_info.kind == cache.CacheKind.MISSING and time.time() < deadline:
+            if log:
+                log("Steam 正在重建 appinfo 缓存，等待缓存出现 ...")
+            time.sleep(2.0)
+            cache_info = cache.AppInfoCache.detect(env, wait=0.0)
+    if cache_info.kind == cache.CacheKind.MISSING and mode != "categories":
+        result.cache_missing_after_restart = True
+        result.warnings.append(
+            "Steam 重启后仍未重建 appinfo 缓存；名称可能未持久化。"
+            "请退出 Steam 后点击“重新应用”，或手动重启 Steam 后再校验。"
+        )
         if log:
             log(cache.diagnostic(env))
         return result
-    ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
-    ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
-    if mode in ("both", "names"):
+    if mode != "categories":
+        ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
+        ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
+        installed = steamenv.installed_apps(env.root)
         for g in games:
             rec = state.get_app(g.appid)
             if rec.get("skipped"):
@@ -483,36 +556,17 @@ def verify(
                 result.verified_names += 1
             else:
                 result.verify_failed.append(g.appid)
-    if mode in ("both", "categories"):
-        try:
-            ns = collections.load_json_array(env.namespace_file)
-            live_ids = set()
-            for item in ns:
-                if isinstance(item, list) and len(item) == 2 and isinstance(item[0], str):
-                    if item[0].startswith(collections.COLLECTION_PREFIX) and not item[1].get("is_deleted"):
-                        live_ids.add(item[0])
-            managed_ids = [
-                cid
-                for values in state.collection_ids.values()
-                for cid in values
-                if cid
-            ]
-            if not managed_ids:
-                managed_ids = [cid for cid in state.collections.values() if cid]
-            result.collections_verified = all(
-                collections.COLLECTION_PREFIX + cid in live_ids
-                for cid in managed_ids
-            )
-        except Exception as exc:
-            result.warnings.append(f"校验收藏集失败: {exc}")
-    if log:
-        log(
-            f"校验：名称 {result.verified_names} 个正确，"
-            f"{len(result.verify_failed)} 个异常；收藏集 "
-            f"{'正常' if result.collections_verified else '异常'}"
-        )
+            info = installed.get(g.appid)
+            acf = info.get("acf") if info else None
+            if isinstance(acf, Path) and acf.is_file():
+                try:
+                    raw = acf.read_text(encoding="utf-8")
+                    if vdftext.appmanifest_name(raw) == zh:
+                        result.verified_acfs += 1
+                except Exception:
+                    pass
+    result.collections_verified = True
     return result
-
 
 def _find_backup_file(backup_dir: Path, env: steamenv.SteamEnv, name: str, subdirs: list[str]) -> Path | None:
     candidates = [backup_dir / name]

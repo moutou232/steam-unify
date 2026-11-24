@@ -290,28 +290,33 @@ def close_steam(env: SteamEnv, timeout: float = 90.0, log=None) -> None:
     )
 
 
-def start_steam(env: SteamEnv) -> None:
+def start_steam(env: SteamEnv, settle: float = 5.0) -> None:
     if not env.exe.is_file():
         raise SteamError(f"找不到 {env.exe}")
-    # Some machines have steam.exe marked "Run as administrator" (or Steam was
-    # started elevated by a launcher).  Launching the executable directly from
-    # a non-elevated process then fails with WinError 740; the steam://
-    # protocol handler starts/focuses Steam without that problem.
-    try:
-        os.startfile("steam://open/")
-        return
-    except Exception:
-        pass
+    # Start the real client first.  steam://open/ can reopen a half-shut
+    # client and leave the news/webhelper page offline (-118).
     try:
         subprocess.Popen(
-            [str(env.exe)],
+            [str(env.exe), "-silent"],
             cwd=str(env.root),
             close_fds=True,
+            creationflags=CREATE_NO_WINDOW,
         )
-    except OSError as exc:
-        raise SteamError(
-            f"无法启动 Steam（{exc}）。请手动打开 Steam 后点击“一键修复/校验”。"
-        ) from exc
+    except OSError:
+        try:
+            os.startfile("steam://open/")
+        except Exception as exc:
+            raise SteamError(
+                f"无法启动 Steam（{exc}）。请手动打开 Steam 后重试。"
+            ) from exc
+    # Let webhelper and the local cache settle before the verifier polls.
+    deadline = time.time() + max(0.0, settle)
+    while time.time() < deadline:
+        if steam_running():
+            break
+        time.sleep(0.25)
+    if settle > 0:
+        time.sleep(min(3.0, settle))
 
 
 def library_folders(root: Path) -> list[Path]:

@@ -153,6 +153,13 @@ def dump(root: dict[str, Any], indent: str = "\t") -> str:
     return "\n".join(lines) + "\n"
 
 
+def appmanifest_name(raw_text: str) -> str:
+    """Return the top-level AppState.name without touching other fields."""
+    import re
+    m = re.search(r'"name"\s+"((?:\\.|[^"])*)"', raw_text)
+    return m.group(1).replace('\\"', '"').replace('\\\\', '\\') if m else ""
+
+
 def replace_appmanifest_name(raw_text: str, new_name: str) -> str:
     """Replace only the top-level AppState.name line, preserving formatting."""
     esc = new_name.replace("\\", "\\\\").replace('"', '\\"')

@@ -648,9 +648,26 @@ class SteamZhApp:
                 msg = f"已写入中文名 {res.names_applied} 个，更新收藏集 {res.collections_changed} 个。"
             if res.warnings:
                 msg += "\n\n提示：\n" + "\n".join(res.warnings[:8])
+            warn = False
             if ver:
-                msg += "\n\n重启后校验完成。"
-            messagebox.showinfo("应用完成", msg, parent=self.root)
+                if getattr(ver, "cache_missing_after_restart", False):
+                    warn = True
+                    msg += ("\n\nSteam 重启后没有找到 appinfo 缓存，"
+                            "名称可能未持久化。\n请完全退出 Steam 后点击“重新应用”。")
+                elif getattr(ver, "verify_failed", []):
+                    warn = True
+                    msg += (f"\n\n重启后名称异常：{len(ver.verify_failed)} 个。\n"
+                            "请退出 Steam 后重新应用。")
+                else:
+                    msg += ("\n\n重启后校验完成："
+                            f"名称 {ver.verified_names} 个，"
+                            f"ACF {ver.verified_acfs} 个。")
+                if getattr(ver, "warnings", []):
+                    msg += "\n" + "\n".join(ver.warnings[:5])
+            if warn:
+                messagebox.showwarning("应用结果需检查", msg, parent=self.root)
+            else:
+                messagebox.showinfo("应用完成", msg, parent=self.root)
             self._append_log(msg.replace("\n", " "))
         elif name == "undo_all":
             res = result
@@ -1188,7 +1205,7 @@ class SteamZhApp:
                 res = service.do_apply(self.ctx, **kwargs)
             ver = None
             if restart:
-                ver = service.do_verify(self.ctx, wait=12,
+                ver = service.do_verify(self.ctx, wait=30,
                                         log=lambda m: self.bus.put(("log", m)), mode=mode)
             return res, ver
 
@@ -1284,7 +1301,7 @@ class SteamZhApp:
         def work():
             res = service.do_autofix(self.ctx, restart=restart, lock_appinfo=lock,
                                      log=lambda m: self.bus.put(("log", m)))
-            ver = service.do_verify(self.ctx, wait=12, log=lambda m: self.bus.put(("log", m))) if restart else None
+            ver = service.do_verify(self.ctx, wait=30, log=lambda m: self.bus.put(("log", m))) if restart else None
             return res, ver
 
         self.run_task("autofix", work)
@@ -1718,7 +1735,7 @@ class SteamZhApp:
         header = tk.Frame(self.root, bg=PANEL, height=50)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        tk.Label(header, text="Steam 统译 v3.1.0", bg=PANEL, fg="#ffffff",
+        tk.Label(header, text="Steam 统译 v3.1.2", bg=PANEL, fg="#ffffff",
                  font=("Microsoft YaHei UI", 16, "bold")).pack(side="left", padx=16)
         tk.Label(header, text="翻译名称 / 分类整理 / 缓存级复原", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=4)
@@ -2140,7 +2157,7 @@ class SteamZhApp:
         messagebox.showinfo("使用说明", "README.md 位于程序目录。", parent=self.root)
 
     def _show_about(self):
-        messagebox.showinfo("关于", "Steam 统译 v3.1.0\n游戏名汉化 / 多标签分类 / 缓存级复原",
+        messagebox.showinfo("关于", "Steam 统译 v3.1.2\n游戏名汉化 / 多标签分类 / 缓存级复原",
                             parent=self.root)
 
 

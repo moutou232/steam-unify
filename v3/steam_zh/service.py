@@ -414,7 +414,7 @@ def do_undo_all(
 
 def do_verify(
     ctx: Context,
-    wait: float = 12.0,
+    wait: float = 30.0,
     log: Callable[[str], None] | None = None,
     mode: str = "both",
 ) -> apply.ApplyResult:

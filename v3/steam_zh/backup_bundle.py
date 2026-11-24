@@ -94,7 +94,7 @@ def export_backup(
         manifest.update({
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
-            "app_version": "3.1.0",
+            "app_version": "3.1.2",
             "created": int(time.time()),
             "account": env.account,
             "cache_kind": cache_info.kind.value,

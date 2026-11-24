@@ -27,7 +27,7 @@ from .translate import probe
 from .ui_components import RoundedSurface, ToggleSwitch
 from .ui_anim import set_motion_mode
 
-APP_TITLE = "Steam 统译 v3.1.0 (Steam Unify)"
+APP_TITLE = "Steam 统译 v3.1.2 (Steam Unify)"
 BG = ui_widgets.BG
 PANEL = ui_widgets.PANEL
 PANEL2 = ui_widgets.PANEL2
