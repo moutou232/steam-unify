@@ -11,23 +11,52 @@ import os
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, ttk
 
 from . import (
     apply,
     category_model,
     category_state,
+    guard,
     providers,
     scoring,
     service,
     ui_widgets,
 )
-from .state import State
+from .state import APP_VERSION, State
 from .translate import probe
 from .ui_components import RoundedSurface, ToggleSwitch
 from .ui_anim import set_motion_mode
 
-APP_TITLE = "Steam 统译 v3.1.2 (Steam Unify)"
+APP_TITLE = f"Steam 统译 v{APP_VERSION} (Steam Unify)"
+
+# Author / repo / feedback channel shown on first run and in 帮助 → 关于.
+AUTHOR = "moutou"
+GITHUB_REPO = "moutou232/steam-unify"
+GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
+FEEDBACK_GROUP = "811327972"
+
+
+def about_lines(first_run: bool = False) -> list[str]:
+    """Text shown by the welcome card and 帮助 → 关于 (Kept UI-free for tests)."""
+    lines = [
+        f"Steam 统译 v{APP_VERSION}",
+        "游戏名汉化 / 多标签分类 / 缓存级复原",
+        "",
+        f"制作者：{AUTHOR}",
+        f"GitHub：{GITHUB_REPO}",
+        f"反馈群：{FEEDBACK_GROUP}",
+    ]
+    if first_run:
+        lines += [
+            "",
+            "使用提示：",
+            "1. 点“自动翻译”，再点“应用全部名称”写入 Steam；",
+            "2. 若名字被 Steam 更新覆盖，用“工具 → 检查名称覆盖”回写；",
+            "3. 设置里已默认开启只读锁定，可防止中文名被覆盖。",
+        ]
+    return lines
 BG = ui_widgets.BG
 PANEL = ui_widgets.PANEL
 PANEL2 = ui_widgets.PANEL2
@@ -556,15 +585,16 @@ class SettingsDialog(tk.Toplevel):
             ).grid(row=r, column=1, sticky="we", **pad)
             r += 1
         for key in ("include_software", "all_known", "use_network", "auto_translate_new",
-                    "restart_steam", "lock_appinfo"):
+                    "restart_steam", "lock_appinfo", "auto_repair_names"):
             self.vars[key] = tk.BooleanVar(value=bool(s.get(key)))
         checks = [
             ("include_software", "包含软件/工具（不只是游戏）"),
             ("all_known", "显示 appinfo 中所有已知游戏（数量很多）"),
-            ("auto_translate_new", "启动扫描时自动联网翻译新增/待翻译游戏（并自动分类）"),
+            ("auto_translate_new", "启动扫描时自动联网翻译新增/待翻译游戏"),
             ("use_network", "允许联网翻译 / 补全简介"),
             ("restart_steam", "应用后自动启动 Steam"),
-            ("lock_appinfo", "应用后把 appinfo.vdf 设为只读（仅旧版单文件缓存）"),
+            ("auto_repair_names", "启动时自动回写被 Steam 覆盖的名称（不重启 Steam）"),
+            ("lock_appinfo", "写入后把 appinfo 缓存设为只读，防止 Steam 覆盖中文名"),
         ]
         for key, label in checks:
             row = tk.Frame(content, bg=BG)
@@ -693,6 +723,7 @@ class SettingsDialog(tk.Toplevel):
             "use_network": bool(self.vars["use_network"].get()),
             "restart_steam": bool(self.vars["restart_steam"].get()),
             "lock_appinfo": bool(self.vars["lock_appinfo"].get()),
+            "auto_repair_names": bool(self.vars["auto_repair_names"].get()),
             "backup_keep": int(self.vars["backup_keep"].get() or 10),
             "window_mode": str(self.vars["window_mode"].get() or "maximized"),
             "ui_motion": str(self.vars["ui_motion"].get() or "full"),
@@ -727,3 +758,212 @@ class SettingsDialog(tk.Toplevel):
         else:
             self.app.update_status()
         self.app.apply_window_mode()
+
+class NameDriftDialog(tk.Toplevel):
+    """List the names Steam replaced and offer one-click write-back."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("检查名称覆盖")
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.grab_set()
+        self.resizable(False, False)
+        self.surface = RoundedSurface(self, radius=14, padding=16)
+        self.surface.pack(fill="both", expand=True)
+        content = self.surface.inner
+
+        try:
+            self.report = service.do_scan_drift(app.ctx)
+        except Exception as exc:
+            messagebox.showerror("检查失败", str(exc), parent=self)
+            self.destroy()
+            return
+
+        report = self.report
+        locked, total = guard.lock_state(app.ctx.env)
+        kind = {
+            "shards": "分片缓存 appinfo_*.vdf",
+            "monolithic": "单文件缓存 appinfo.vdf",
+        }.get(report.cache_kind, "未找到 appinfo 缓存")
+        tk.Label(content, text=f"Steam 名称守护 · {kind}", bg=BG, fg=FG).pack(anchor="w")
+        rows = [
+            f"已记录应用名称：{report.applied_total} 个",
+            f"名称正常：{max(0, report.checked - report.count)} 个",
+            f"被 Steam 覆盖：{report.count} 个",
+        ]
+        if report.missing:
+            rows.append(f"缓存中已不存在（家庭共享失效/下架）：{len(report.missing)} 个")
+        if report.recent_refreshes:
+            rows.append(
+                f"Steam 最近刷新：{len(report.recent_refreshes)} 个，"
+                f"其中 {len(report.refreshed_drifted)} 个名称被覆盖"
+            )
+        if locked:
+            rows.append(f"只读锁定：{locked}/{total} 个 appinfo 文件（Steam 无法覆盖这些名称）")
+        tk.Label(content, text="\n".join(rows), bg=BG, fg=MUTED, justify="left").pack(
+            anchor="w", pady=(4, 8)
+        )
+
+        if report.drifted:
+            box = tk.Frame(content, bg=PANEL2)
+            box.pack(fill="both", expand=True)
+            lb = tk.Listbox(
+                box, height=min(12, max(4, len(report.drifted))), width=92,
+                bg=PANEL2, fg=FG, relief="flat", highlightthickness=0,
+            )
+            lb.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+            scroll = tk.Scrollbar(box, command=lb.yview)
+            scroll.pack(side="right", fill="y")
+            lb.configure(yscrollcommand=scroll.set)
+            refreshed = set(report.refreshed_drifted)
+            for appid in sorted(report.drifted, key=lambda a: str(a)):
+                rec = app.ctx.state.get_app(appid)
+                zh = str(rec.get("zh_name") or "")
+                mark = "  [Steam 刚刷新]" if appid in refreshed else ""
+                lb.insert(
+                    "end",
+                    f"{appid}  {zh}  ←  {report.drifted[appid]}{mark}",
+                )
+        else:
+            tk.Label(
+                content,
+                text="没有发现被 Steam 覆盖的名称。Steam 每次启动都会更新部分游戏元数据，"
+                     "开启只读锁定可以避免名称被覆盖。",
+                bg=BG, fg=MUTED, wraplength=760, justify="left",
+            ).pack(anchor="w", pady=6)
+
+        btns = tk.Frame(content, bg=BG)
+        btns.pack(fill="x", pady=(10, 0))
+        if report.drifted:
+            ttk.Button(btns, text="仅回写（不重启 Steam）",
+                       command=lambda: self._start(lock=False, restart=False, close=False)
+                       ).pack(side="left", padx=4)
+            ttk.Button(btns, text="回写并重启 Steam", style="Accent.TButton",
+                       command=lambda: self._start(lock=False, restart=True, close=True)
+                       ).pack(side="left", padx=4)
+            ttk.Button(btns, text="回写并锁定（推荐）",
+                       command=lambda: self._start(lock=True, restart=True, close=True)
+                       ).pack(side="left", padx=4)
+            ttk.Button(btns, text="全部重写…", command=self._full_rewrite).pack(
+                side="left", padx=4
+            )
+        if locked:
+            ttk.Button(btns, text="解除只读锁定", command=self._unlock).pack(side="left", padx=4)
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="right", padx=4)
+
+        self.update_idletasks()
+        w, h = self.surface.fit_content(860, 460)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(w, sw - 40), min(h, sh - 80)
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(20, (sh - h) // 2)}")
+
+    def _start(self, *, lock: bool, restart: bool, close: bool) -> None:
+        report = self.report
+        self.destroy()
+
+        def work():
+            return service.do_repair_drift(
+                self.app.ctx,
+                restart=restart,
+                lock=lock,
+                allow_close=close,
+                report=report,
+                log=lambda m: self.app.bus.put(("log", m)),
+            )
+
+        self.app.run_task("guard_apply", work)
+
+    def _full_rewrite(self) -> None:
+        self.destroy()
+        self.app.on_autofix()
+
+    def _unlock(self) -> None:
+        self.destroy()
+        self.app.on_unlock_appinfo()
+
+
+class AboutDialog(tk.Toplevel):
+    """Author / repo / feedback card used by the welcome and 关于 entry."""
+
+    def __init__(self, app, first_run: bool = False):
+        super().__init__(app.root)
+        self.app = app
+        self.first_run = first_run
+        self.title("欢迎使用 Steam 统译" if first_run else "关于 Steam 统译")
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.grab_set()
+        self.resizable(False, False)
+        self.surface = RoundedSurface(self, radius=14, padding=18)
+        self.surface.pack(fill="both", expand=True)
+        content = self.surface.inner
+
+        lines = about_lines(first_run)
+        tk.Label(
+            content,
+            text=lines[0],
+            bg=BG,
+            fg="#ffffff",
+            font=("Microsoft YaHei UI", 13, "bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        for line in lines[1:]:
+            color = MUTED if (not line or line.endswith("提示：")) else FG
+            tk.Label(
+                content,
+                text=line,
+                bg=BG,
+                fg=color,
+                justify="left",
+                anchor="w",
+                font=("Microsoft YaHei UI", 9),
+            ).pack(anchor="w", pady=(2 if line else 4, 0))
+
+        self.status_var = tk.StringVar()
+        buttons = tk.Frame(content, bg=BG)
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(
+            buttons, text="打开 GitHub", style="Small.TButton", command=self._open_repo
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            buttons, text="复制反馈群号", style="Small.TButton", command=self._copy_group
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            buttons,
+            text="知道了" if first_run else "关闭",
+            style="Accent.TButton",
+            command=self.destroy,
+        ).pack(side="right")
+        tk.Label(
+            content, textvariable=self.status_var, bg=BG, fg=GREEN,
+            font=("Microsoft YaHei UI", 9), anchor="w",
+        ).pack(anchor="w", pady=(6, 0))
+
+        self.update_idletasks()
+        w, h = self.surface.fit_content(520, 300)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(w, sw - 40), min(h, sh - 80)
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(20, (sh - h) // 2)}")
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _open_repo(self) -> None:
+        try:
+            webbrowser.open(GITHUB_URL)
+            self.status_var.set(f"已在浏览器打开 {GITHUB_REPO}")
+        except Exception as exc:
+            self.status_var.set(f"打开失败：{exc}")
+
+    def _copy_group(self) -> None:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(FEEDBACK_GROUP)
+            self.update()
+            self.status_var.set(f"已复制反馈群号 {FEEDBACK_GROUP}")
+        except Exception as exc:
+            self.status_var.set(f"复制失败：{exc}")

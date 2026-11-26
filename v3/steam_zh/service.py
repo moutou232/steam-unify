@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import apply, categories, category_batch, category_model, category_state, collections, metadata, originals, paths, providers, scoring, steamenv, translate, undo
+from . import apply, categories, category_batch, category_model, category_state, collections, guard, metadata, originals, paths, providers, scoring, steamenv, translate, undo
 from .metadata import GameInfo
 from .state import State
 
@@ -444,6 +444,39 @@ def do_autofix(
         lock_appinfo=lock_appinfo,
         log=log,
     )
+
+
+def do_scan_drift(ctx: Context) -> guard.DriftReport:
+    """Compare applied Chinese names with the live Steam cache (read-only)."""
+    return guard.scan_drift(ctx.env, ctx.state)
+
+
+def do_repair_drift(
+    ctx: Context,
+    *,
+    restart: bool = False,
+    lock: bool = False,
+    allow_close: bool = True,
+    report: guard.DriftReport | None = None,
+    log: Callable[[str], None] | None = None,
+) -> guard.RepairResult:
+    return guard.repair_drift(
+        ctx.env,
+        ctx.state,
+        report,
+        restart=restart,
+        lock=lock,
+        allow_close=allow_close,
+        log=log,
+    )
+
+
+def do_lock_names(ctx: Context, appids: set[int] | None = None) -> int:
+    return guard.lock_shards(ctx.env, ctx.state, appids)
+
+
+def do_unlock_names(ctx: Context) -> int:
+    return guard.unlock_shards(ctx.env, ctx.state)
 
 
 def latest_backups(limit: int = 10) -> list[Path]:

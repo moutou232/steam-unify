@@ -67,6 +67,7 @@ def undo_all(
                     pass
             raise
 
+    apply.unlock_all_shards(env.shard_dir)
     try:
         appids = sorted(int(a) for a in state.apps.keys())
         total = max(1, len(appids))

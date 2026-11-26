@@ -18,6 +18,7 @@ from . import (
     category_model,
     category_state,
     descriptions,
+    guard,
     paths,
     providers,
     scoring,
@@ -39,17 +40,27 @@ from .gui_dialogs import (
     SOURCE_LABEL,
     STATUS_FILTERS,
     ACCENT,
+    AboutDialog,
     BatchCategoryDialog,
     CategoryPickerDialog,
+    NameDriftDialog,
     NameEditDialog,
     SettingsDialog,
 )
-from .state import State
+from .state import APP_VERSION, State
 from .gui_plan_dialogs import PlanImportDialog
 from .ui_anim import Animator, set_motion_mode
 from .ui_components import (toast, ToggleSwitch, MotionButton, RoundedSurface, RoundedField, TabBar, AnimatedSelect, AnimatedMenuButton)
 from .ui_sidebar import SidebarList
 from . import collection_plan
+
+# The two workspaces shown in the tab bar and the 视图 menu.  "全部" was
+# removed in v3.1.4: applying names lives on the 翻译名称 workspace.
+WORKSPACES: list[tuple[str, str]] = [
+    ("names", "翻译名称"),
+    ("categories", "分类整理"),
+]
+DEFAULT_WORKSPACE = "names"
 
 
 class SteamZhApp:
@@ -82,8 +93,9 @@ class SteamZhApp:
         self.sort_desc = True
         self.log_visible = False
         self.last_batch_snapshot: dict[int, list[str]] | None = None
+        self.drift_report = None
         self._sidebar_guard = False
-        self.workspace = "both"
+        self.workspace = DEFAULT_WORKSPACE
         self._collection_filter: set[int] | None = None
         self._collection_name = ""
         self.inspector_visible = True
@@ -104,7 +116,25 @@ class SteamZhApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._update_undo_button()
         self.root.after(100, self._poll_bus)
+        self.root.after(900, self._maybe_first_run)
         self.reload()
+
+    def _maybe_first_run(self) -> None:
+        """Show the author / repo / feedback-group card once per install."""
+        if bool(self.settings.get("first_run_done", False)):
+            return
+        try:
+            self._welcome = AboutDialog(self, first_run=True)
+        except Exception as exc:
+            self._append_log(f"欢迎窗口打开失败：{exc}")
+        self.settings["first_run_done"] = True
+        try:
+            if self.ctx is not None:
+                self.ctx.state.save_settings(self.settings)
+            else:
+                State.load().save_settings(self.settings)
+        except Exception as exc:
+            self._append_log(f"保存首次启动标记失败：{exc}")
 
     def apply_window_mode(self) -> None:
         mode = str(self.settings.get("window_mode") or "maximized")
@@ -594,6 +624,9 @@ class SteamZhApp:
                 self.update_status()
             return
         if name == "load":
+            drift = None
+            if isinstance(result, tuple) and len(result) == 2:
+                result, drift = result
             self.ctx = result
             self.games_by_id = {g.appid: g for g in self.ctx.games}
             self.refresh_table()
@@ -607,7 +640,28 @@ class SteamZhApp:
             self.update_status()
             self._append_log("已跳过启动时自动获取原名；需要时请点“工具 → 补全原名”。")
             self._append_log("扫描完成，不会自动翻译；需要时请点击“自动翻译”。")
+            self._on_drift_scan(drift)
             self._maybe_auto_translate_new()
+        elif name == "guard_repair":
+            res = result
+            self._append_log(res.summary())
+            if res.repaired:
+                self._append_log("名称已回写，Steam 下次启动时会显示中文名。")
+            if res.need_close:
+                self._append_log(
+                    "Steam 正在占用 appinfo 缓存；打开“工具 → 检查名称覆盖”"
+                    "可选择关闭 Steam 后修复。"
+                )
+            for warning in res.warnings[:5]:
+                self._append_log(f"名称回写提示：{warning}")
+            self._refresh_drift()
+            self._maybe_auto_translate_new()
+        elif name == "guard_apply":
+            res = result
+            self._append_log(res.summary())
+            for warning in res.warnings[:5]:
+                self._append_log(f"名称修复提示：{warning}")
+            self._refresh_drift()
         elif name == "auto_new_translate":
             service.auto_categorize(self.ctx)
             self.refresh_table()
@@ -640,35 +694,32 @@ class SteamZhApp:
             self.refresh_table()
             self.refresh_sidebar()
             self.update_status()
-            if mode == "names":
-                msg = f"已写入中文名 {res.names_applied} 个。"
-            elif mode == "categories":
-                msg = f"已更新收藏集 {res.collections_changed} 个。"
-            else:
-                msg = f"已写入中文名 {res.names_applied} 个，更新收藏集 {res.collections_changed} 个。"
-            if res.warnings:
-                msg += "\n\n提示：\n" + "\n".join(res.warnings[:8])
-            warn = False
+            msg = apply.describe_result(res, mode)
             if ver:
                 if getattr(ver, "cache_missing_after_restart", False):
-                    warn = True
-                    msg += ("\n\nSteam 重启后没有找到 appinfo 缓存，"
-                            "名称可能未持久化。\n请完全退出 Steam 后点击“重新应用”。")
-                elif getattr(ver, "verify_failed", []):
-                    warn = True
-                    msg += (f"\n\n重启后名称异常：{len(ver.verify_failed)} 个。\n"
-                            "请退出 Steam 后重新应用。")
+                    msg += "\n\n重启后仍未读到 appinfo 缓存；稍后可用“检查名称覆盖”补写。"
                 else:
-                    msg += ("\n\n重启后校验完成："
-                            f"名称 {ver.verified_names} 个，"
-                            f"ACF {ver.verified_acfs} 个。")
+                    msg += (
+                        "\n\n重启后校验："
+                        f"名称 {ver.verified_names} 个，ACF {ver.verified_acfs} 个。"
+                    )
+                    if getattr(ver, "drifted", []):
+                        msg += (
+                            f"\n有 {len(ver.drifted)} 个名称被 Steam 覆盖，"
+                            "可在“工具 → 检查名称覆盖”中回写。"
+                        )
                 if getattr(ver, "warnings", []):
                     msg += "\n" + "\n".join(ver.warnings[:5])
-            if warn:
+            if getattr(res, "cache_missing_after_restart", False):
                 messagebox.showwarning("应用结果需检查", msg, parent=self.root)
             else:
                 messagebox.showinfo("应用完成", msg, parent=self.root)
             self._append_log(msg.replace("\n", " "))
+            if getattr(res, "drifted", []):
+                self._append_log(
+                    f"有 {len(res.drifted)} 个名称已被 Steam 覆盖，"
+                    "已记录；打开“工具 → 检查名称覆盖”可回写。"
+                )
         elif name == "undo_all":
             res = result
             self.last_batch_snapshot = None
@@ -1582,16 +1633,26 @@ class SteamZhApp:
         c = service.counts(self.ctx)
         running = steamenv.steam_running()
         cache = "分片缓存" if self.ctx.env.has_shards else "单文件缓存"
+        drift = getattr(self, "drift_report", None)
+        drift_text = ""
+        if drift is not None and getattr(drift, "count", 0):
+            drift_text = f" · ⚠ {drift.count} 个名称待回写"
+        locked, total = guard.lock_state(self.ctx.env)
+        lock_text = f" · 已锁定 {locked}/{total}" if locked else ""
         text = (
             f"{'Steam 运行中' if running else 'Steam 已关闭'} · "
             f"{self.ctx.env.persona or self.ctx.env.account} · {cache} · "
             f"共 {c['total']} · 已应用 {c['applied']} · 待翻译 {c['missing']}"
+            f"{drift_text}{lock_text}"
         )
         self.status_var.set(text)
-        self.header_status.set(
+        header = (
             f"{self.ctx.env.persona or self.ctx.env.account} · "
             f"{'Steam 运行中' if running else 'Steam 已关闭'}"
         )
+        if drift_text:
+            header += drift_text
+        self.header_status.set(header)
 
 
     def reload(self) -> None:
@@ -1600,8 +1661,90 @@ class SteamZhApp:
         self._append_log("正在扫描 Steam 本地缓存 ...")
         self.cancel_flag = False
         def work():
-            return service.load_context(self.settings)
+            ctx = service.load_context(self.settings)
+            try:
+                report = service.do_scan_drift(ctx)
+            except Exception as exc:
+                report = None
+                self.bus.put(("log", f"名称检查失败：{exc}"))
+            return ctx, report
         self.run_task("load", work)
+
+    def _on_drift_scan(self, report) -> None:
+        """Log the drift summary and optionally write the names back."""
+        self.drift_report = report
+        if report is None:
+            return
+        self._append_log(report.summary())
+        if not report.present:
+            return
+        if not report.count:
+            return
+        if bool(self.settings.get("auto_repair_names", True)):
+            self._append_log(
+                f"检测到 {report.count} 个名称被 Steam 覆盖，正在自动回写 ..."
+            )
+
+            def work():
+                return service.do_repair_drift(
+                    self.ctx,
+                    restart=False,
+                    lock=False,
+                    allow_close=False,
+                    report=report,
+                    log=lambda m: self.bus.put(("log", m)),
+                )
+
+            self.run_task("guard_repair", work)
+        else:
+            self._append_log(
+                "可在“工具 → 检查名称覆盖”中回写，或在设置中开启“启动后自动回写”。"
+            )
+
+    def _refresh_drift(self) -> None:
+        """Re-scan the cache after a write-back so the status line is accurate."""
+        if not self.ctx:
+            return
+        try:
+            self.drift_report = service.do_scan_drift(self.ctx)
+        except Exception as exc:
+            self._append_log(f"名称检查失败：{exc}")
+            self.update_status()
+            return
+        if self.drift_report.count:
+            self._append_log(
+                f"仍有 {self.drift_report.count} 个名称待回写（Steam 可能正在写缓存）"
+            )
+        else:
+            self._append_log("名称检查：全部正常")
+        self.update_status()
+
+    def on_check_drift(self) -> None:
+        if not self.ctx:
+            return
+        NameDriftDialog(self)
+
+    def on_unlock_appinfo(self) -> None:
+        if not self.ctx:
+            return
+        locked, total = guard.lock_state(self.ctx.env)
+        if not locked:
+            messagebox.showinfo("解除锁定", "当前没有只读锁定的 appinfo 文件。", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "解除锁定",
+            f"当前有 {locked}/{total} 个 appinfo 文件被设为只读。\n"
+            "解锁后 Steam 会重新更新这些游戏的元数据（中文名可能再次被覆盖）。\n是否继续？",
+            parent=self.root,
+        ):
+            return
+        try:
+            count = service.do_unlock_names(self.ctx)
+        except Exception as exc:
+            messagebox.showerror("解除锁定失败", str(exc), parent=self.root)
+            return
+        self._append_log(f"已解除 {count} 个 appinfo 文件只读")
+        self.update_status()
 
     def _maybe_auto_translate_new(self) -> None:
         if not self.ctx or not bool(self.settings.get("auto_translate_new", False)):
@@ -1735,7 +1878,7 @@ class SteamZhApp:
         header = tk.Frame(self.root, bg=PANEL, height=50)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        tk.Label(header, text="Steam 统译 v3.1.2", bg=PANEL, fg="#ffffff",
+        tk.Label(header, text=f"Steam 统译 v{APP_VERSION}", bg=PANEL, fg="#ffffff",
                  font=("Microsoft YaHei UI", 16, "bold")).pack(side="left", padx=16)
         tk.Label(header, text="翻译名称 / 分类整理 / 缓存级复原", bg=PANEL, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=4)
@@ -1833,7 +1976,7 @@ class SteamZhApp:
         log_sb = ttk.Scrollbar(self.log_body, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_sb.set)
         log_sb.pack(side="right", fill="y")
-        self._set_workspace("both", initial=True)
+        self._set_workspace(DEFAULT_WORKSPACE, initial=True)
 
     def _build_menubar(self) -> None:
         bar = tk.Frame(self.root, bg="#0e141b", height=26)
@@ -1858,7 +2001,7 @@ class SteamZhApp:
         m.add_command(label="编辑名称", command=self._edit_selected_name)
         m.add_command(label="编辑分类", command=self._edit_selected_category)
         m = add("视图")
-        for key, label in (("names", "翻译名称"), ("categories", "分类整理"), ("both", "全部")):
+        for key, label in WORKSPACES:
             m.add_command(label=label, command=lambda k=key: self._set_workspace(k))
         m.add_separator()
         m.add_command(label="显示/隐藏参考源", command=self._toggle_inspector)
@@ -1875,11 +2018,7 @@ class SteamZhApp:
         m.add_command(label="关于", command=self._show_about)
 
     def _build_tabs(self, parent):
-        self.tabbar = TabBar(parent, [
-            ("names", "翻译名称"),
-            ("categories", "分类整理"),
-            ("both", "全部"),
-        ], self._set_workspace)
+        self.tabbar = TabBar(parent, WORKSPACES, self._set_workspace)
         self.tabbar.pack(side="left", fill="x", expand=True)
         ttk.Button(parent, text="参考源", style="Small.TButton",
                    command=self._toggle_inspector).pack(side="right", padx=(8, 0))
@@ -1915,12 +2054,11 @@ class SteamZhApp:
                 ("remove_from_collection", "从收藏集移除", self.on_remove_from_collection, ""),
             ],
         ])
-        make("both", [
-            ("apply_all", "应用全部名称", lambda: self.on_apply(False, "names"), "Primary.TButton"),
-            ("apply_sel_all", "应用选中名称", lambda: self.on_apply(True, "names"), ""),
-        ])
         right = tk.Frame(parent, bg=BG); right.pack(side="right")
         tools = AnimatedMenuButton(right, "⚙ 工具", [
+            ("检查名称覆盖", None, self.on_check_drift),
+            ("解除 appinfo 只读锁定", None, self.on_unlock_appinfo),
+            None,
             ("导出清单", None, self.on_export),
             ("导出备份", None, self.on_export_backup),
             ("导入备份", None, self.on_import_backup),
@@ -1963,7 +2101,7 @@ class SteamZhApp:
         self._inspector_candidates = []
 
     def _set_workspace(self, workspace: str, initial: bool = False) -> None:
-        if workspace not in ("names", "categories", "both"):
+        if workspace not in {key for key, _label in WORKSPACES}:
             return
         # Snapshot transitions are disabled: Windows DPI scaling makes a
         # cropped screenshot visually unreliable.  The tab capsule still
@@ -2133,8 +2271,6 @@ class SteamZhApp:
                 enabled = self.last_batch_snapshot is not None
             elif key == "apply_names":
                 enabled = any_names
-            elif key == "apply_all":
-                enabled = any_names
             if self.busy:
                 enabled = False
             button.configure(state="normal" if enabled else "disabled")
@@ -2157,8 +2293,7 @@ class SteamZhApp:
         messagebox.showinfo("使用说明", "README.md 位于程序目录。", parent=self.root)
 
     def _show_about(self):
-        messagebox.showinfo("关于", "Steam 统译 v3.1.2\n游戏名汉化 / 多标签分类 / 缓存级复原",
-                            parent=self.root)
+        AboutDialog(self)
 
 
 def main() -> None:

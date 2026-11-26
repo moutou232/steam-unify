@@ -11,7 +11,9 @@ All code that touches names must go through :class:`AppInfoCache`.
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -85,12 +87,117 @@ class AppInfoCache:
             raise CacheError("当前 Steam 使用分片 appinfo 缓存，不能读取单文件")
         return appinfo.AppInfo.load(self.appinfo_path)
 
+    def load_names(self) -> "CacheNames":
+        """Read-only view over either layout, for name checks and drift scans."""
+        if self.kind == CacheKind.SHARDS:
+            return CacheNames(
+                CacheKind.SHARDS,
+                shards=self.load_shards(),
+                shard_dir=self.shard_dir,
+            )
+        if self.kind == CacheKind.MONOLITHIC:
+            return CacheNames(
+                CacheKind.MONOLITHIC,
+                app_info=self.load_appinfo(),
+                appinfo_path=self.appinfo_path,
+            )
+        raise CacheError("未找到 appinfo 缓存，无法读取名称")
+
     def describe(self) -> str:
         if self.kind == CacheKind.SHARDS:
             return "分片 appinfo 缓存"
         if self.kind == CacheKind.MONOLITHIC:
             return "单文件 appinfo.vdf"
         return "未找到 appinfo 缓存"
+
+
+@dataclass
+class CacheNames:
+    """Read-only name view over a monolithic appinfo.vdf or the shard set."""
+
+    kind: CacheKind
+    shards: ShardSet | None = None
+    app_info: appinfo.AppInfo | None = None
+    shard_dir: Path | None = None
+    appinfo_path: Path | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def exists(self) -> bool:
+        return self.kind != CacheKind.MISSING
+
+    def __post_init__(self) -> None:
+        if self.shards is not None:
+            self.warnings.extend(self.shards.warnings)
+
+    def appids(self) -> list[int]:
+        if self.shards is not None:
+            return list(self.shards.by_appid)
+        if self.app_info is not None:
+            return [e.appid for e in self.app_info.entries]
+        return []
+
+    def get(self, appid: int) -> str | None:
+        if self.shards is not None:
+            return self.shards.get_name(appid)
+        if self.app_info is not None:
+            return self.app_info.get_name(appid)
+        return None
+
+    def localized(self, appid: int) -> dict[str, str] | None:
+        if self.shards is not None:
+            return self.shards.get_localized(appid)
+        if self.app_info is not None:
+            return self.app_info.get_localized(appid)
+        return None
+
+    def shard_files_for(self, appids: set[int]) -> list[Path]:
+        """Files that hold at least one of ``appids`` (empty for monolithic)."""
+        if self.shards is None:
+            return []
+        return sorted({sh.path for sh in self.shards.shards if any(r.appid in appids for r in sh.records)})
+
+
+@dataclass
+class DiffResult:
+    """Expected names that the cache no longer satisfies."""
+
+    drifted: dict[int, str] = field(default_factory=dict)   # appid -> current name
+    missing: list[int] = field(default_factory=list)        # appid absent from cache
+
+    @property
+    def ok(self) -> bool:
+        return not self.drifted and not self.missing
+
+    @property
+    def count(self) -> int:
+        return len(self.drifted) + len(self.missing)
+
+
+def compare_names(view: CacheNames, expected: dict[int, str]) -> DiffResult:
+    """Pure comparison of ``expected`` (appid -> Chinese name) with the cache."""
+    out = DiffResult()
+    for appid, want in expected.items():
+        current = view.get(appid)
+        if current is None:
+            out.missing.append(appid)
+        elif current != want:
+            out.drifted[appid] = current
+    return out
+
+
+def readonly_shards(shard_dir: Path | None) -> list[Path]:
+    """Shard files currently write-protected (produced by the lock feature)."""
+    if shard_dir is None or not shard_dir.is_dir():
+        return []
+    out: list[Path] = []
+    for path in shard_dir.glob("appinfo_*.vdf"):
+        try:
+            if not os.stat(path).st_mode & stat.S_IWRITE:
+                out.append(path)
+        except OSError:
+            continue
+    return out
 
 
 @dataclass
@@ -178,10 +285,13 @@ def diagnostic(env: steamenv.SteamEnv) -> str:
             return f"存在，{st.st_size} bytes，{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime))}"
         except OSError:
             return "存在，无法读取属性"
+    locked = readonly_shards(shard_dir) if shards else []
+    lock_line = f"- 只读分片：{len(locked)} 个\n" if locked else ""
     return (
         "缓存诊断：\n"
         f"- appcache/appinfo.vdf：{state(mono)}\n"
         f"- steamapps/appinfo.vdf：{state(alt)}\n"
         f"- shards：{len(shards)} 个（{shard_dir}）\n"
+        f"{lock_line}"
         f"- 本次将使用：{chosen.describe()}"
     )

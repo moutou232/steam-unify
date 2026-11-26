@@ -9,7 +9,7 @@ import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import appinfo, cache, category_state, collections, paths, steamenv, vdftext
 from .appinfo_shards import ShardSet
@@ -31,6 +31,7 @@ class ApplyError(Exception):
 class ApplyResult:
     backup: Path | None = None
     names_applied: int = 0
+    names_expected: int = 0
     acfs_updated: int = 0
     collections_changed: int = 0
     collection_skipped: list[str] = field(default_factory=list)
@@ -38,10 +39,15 @@ class ApplyResult:
     verified_names: int = 0
     verified_acfs: int = 0
     verify_failed: list[int] = field(default_factory=list)
+    drifted: list[int] = field(default_factory=list)
     collections_verified: bool = False
     steam_restarted: bool = False
     cache_missing_after_restart: bool = False
     cache_migration_timeout: bool = False
+    cache_ready: bool = False
+    cache_rebuilt: bool = False
+    repaired: int = 0
+    locked_shards: int = 0
 
 
 def _copy(src: Path, dst: Path) -> None:
@@ -140,6 +146,169 @@ def is_readonly(path: Path) -> bool:
         return False
 
 
+def unlock_all_shards(shard_dir: Path | None) -> int:
+    """Make every shard writable again (the lock feature sets them read-only)."""
+    if not shard_dir or not shard_dir.is_dir():
+        return 0
+    count = 0
+    for path in shard_dir.glob("appinfo_*.vdf"):
+        if is_readonly(path):
+            _set_readonly(path, False)
+            count += 1
+    return count
+
+
+def names_from_state(state: State, appids: Iterable[int] | None = None) -> dict[int, str]:
+    """Names the user asked for and that were already applied at least once."""
+    wanted = set(appids) if appids is not None else None
+    out: dict[int, str] = {}
+    for key, rec in state.apps.items():
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("skipped"):
+            continue
+        if str(rec.get("source") or "") == "original":
+            continue
+        if not rec.get("applied"):
+            continue
+        zh = str(rec.get("zh_name") or "").strip()
+        if not zh:
+            continue
+        try:
+            appid = int(key)
+        except (TypeError, ValueError):
+            continue
+        if wanted is not None and appid not in wanted:
+            continue
+        out[appid] = zh
+    return out
+
+
+def _names_accessor(cache_obj):
+    """Return (get_name, get_localized, remove_localized, set_name) for a view."""
+    shards = getattr(cache_obj, "shards", None)
+    if shards is not None:
+        return shards.get_name, shards.get_localized, shards.remove_localized, shards.set_name
+    app_info = getattr(cache_obj, "app_info", None)
+    if app_info is not None:
+        return (
+            app_info.get_name,
+            app_info.get_localized,
+            app_info.remove_localized,
+            app_info.set_name,
+        )
+    raise ApplyError("缓存视图既不是分片也不是单文件")
+
+
+def write_names(
+    cache_obj,
+    names: dict[int, str],
+    *,
+    state: State | None = None,
+    warnings: list[str] | None = None,
+    labels: dict[int, str] | None = None,
+) -> list[int]:
+    """Write ``names`` into a loaded cache view and return the changed appids.
+
+    The caller owns saving/verification.  ``common.name_localized`` is removed
+    so the custom name wins in every language, and the removed mapping is kept
+    in state for undo.
+    """
+    get_name, get_localized, remove_localized, set_name = _names_accessor(cache_obj)
+    changed: list[int] = []
+    for appid, zh in names.items():
+        try:
+            if (get_name(appid) or "") == zh and not get_localized(appid):
+                continue
+            orig_localized = remove_localized(appid)
+            if state is not None and orig_localized:
+                rec = state.get_app(appid)
+                if not rec.get("orig_localized"):
+                    rec["orig_localized"] = orig_localized
+            set_name(appid, zh)
+            changed.append(appid)
+        except Exception as exc:
+            if warnings is not None:
+                label = (labels or {}).get(appid) or str(appid)
+                warnings.append(f"{label}: {exc}")
+    return changed
+
+
+def save_names(cache_obj) -> None:
+    """Persist a view mutated through :func:`write_names`."""
+    shards = getattr(cache_obj, "shards", None)
+    if shards is not None:
+        # ShardSet.save() is a no-op when nothing is dirty.
+        _retry_write(shards.save)
+        return
+    app_info = getattr(cache_obj, "app_info", None)
+    if app_info is None:
+        return
+    info = getattr(cache_obj, "info", None)
+    target = getattr(cache_obj, "appinfo_path", None)
+    if target is None and info is not None:
+        target = info.appinfo_path
+    if target is None:
+        raise ApplyError("单文件 appinfo 缓存没有路径，无法保存")
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = app_info.build()
+    tmp = target.with_name(target.name + ".tmp")
+
+    def write_file() -> None:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+
+    _retry_write(write_file)
+
+
+def lock_written_shards(cache_obj, appids: list[int], state: State | None) -> int:
+    """Write-protect the cache files that hold ``appids`` (prevents overwrites).
+
+    Files locked by earlier runs stay locked: the previous list is kept in
+    ``state.data['locked_shards']`` and re-applied here, so applying a few new
+    names never silently unlocks older ones.
+    """
+    wanted = set(appids)
+    shards = getattr(cache_obj, "shards", None)
+    info = getattr(cache_obj, "info", None)
+    kind = info.kind if info is not None else None
+    if shards is not None:
+        files = {
+            sh.path for sh in shards.shards
+            if any(rec.appid in wanted for rec in sh.records)
+        }
+        if state is not None:
+            locked = state.data.get("locked_shards")
+            if not isinstance(locked, list):
+                locked = state.data["locked_shards"] = []
+            directory = getattr(shards, "directory", None)
+            if directory is not None:
+                for name in list(locked):
+                    path = Path(directory) / str(name)
+                    if path.is_file():
+                        files.add(path)
+            for path in files:
+                _set_readonly(path, True)
+            for path in files:
+                if path.name not in locked:
+                    locked.append(path.name)
+        else:
+            for path in files:
+                _set_readonly(path, True)
+        return len(files)
+    target = getattr(cache_obj, "appinfo_path", None)
+    if target is None and info is not None:
+        target = info.appinfo_path
+    if target is not None and kind == cache.CacheKind.MONOLITHIC:
+        _set_readonly(Path(target), True)
+        return 1
+    return 0
+
+
 def backup(
     env: steamenv.SteamEnv,
     state: State,
@@ -196,7 +365,7 @@ def prune_backups(keep: int = 10, root: Path | None = None) -> None:
         reverse=True,
     )
     for old in dirs[max(1, keep):]:
-        shutil.rmtree(old, ignore_errors=True)
+        _force_rmtree(old)
 
 
 def _plan_names(
@@ -313,77 +482,32 @@ def apply_changes(
     if progress:
         progress(f"已备份，正在写入 {cache_info.describe() if cache_info.exists else '分类收藏集'} ...")
 
-    # Make sure appinfo is writable (we may have locked it previously).
+    # Make sure the cache is writable (we may have locked it previously).
     if cache_info.kind == cache.CacheKind.MONOLITHIC and cache_info.appinfo_path and is_readonly(cache_info.appinfo_path):
         _set_readonly(cache_info.appinfo_path, False)
+    if cache_info.kind == cache.CacheKind.SHARDS:
+        unlock_all_shards(cache_info.shard_dir)
+        if not lock_appinfo:
+            # Locking is off: the cache must stay writable for Steam.
+            state.data["locked_shards"] = []
 
     try:
         if mode == "categories":
             planned, names = [], {}
         else:
             planned, names = _plan_names(state, games, selected)
+        result.names_expected = len(names)
         changed_ids: list[int] = []
-        if mode == "categories":
-            pass
-        elif cache_info.kind == cache.CacheKind.SHARDS:
-            assert snapshot is not None and snapshot.shards is not None
-            ss = snapshot.shards
-            for g in planned:
-                zh = names[g.appid]
-                try:
-                    current = ss.get_name(g.appid) or ""
-                    localized = ss.get_localized(g.appid)
-                    if current == zh and not localized:
-                        continue
-                    orig_localized = ss.remove_localized(g.appid)
-                    rec = state.get_app(g.appid)
-                    if orig_localized and not rec.get("orig_localized"):
-                        rec["orig_localized"] = orig_localized
-                    ss.set_name(g.appid, zh)
-                    changed_ids.append(g.appid)
-                except Exception as exc:
-                    result.warnings.append(f"{g.appid} {g.name}: {exc}")
+        if mode != "categories" and snapshot is not None:
+            labels = {g.appid: f"{g.appid} {g.name}" for g in planned}
+            changed_ids = write_names(
+                snapshot, names, state=state, warnings=result.warnings, labels=labels
+            )
             if changed_ids:
-                _retry_write(ss.save)
+                save_names(snapshot)
                 _verify_cache_written(snapshot, changed_ids, names)
             if lock_appinfo:
-                result.warnings.append("分片 appinfo 模式不支持只读锁定，已跳过")
-        else:
-            assert snapshot is not None and snapshot.app_info is not None
-            ai = snapshot.app_info
-            for g in planned:
-                zh = names[g.appid]
-                try:
-                    current = ai.get_name(g.appid) or ""
-                    localized = ai.get_localized(g.appid)
-                    if current == zh and not localized:
-                        continue
-                    orig_localized = ai.remove_localized(g.appid)
-                    rec = state.get_app(g.appid)
-                    if orig_localized and not rec.get("orig_localized"):
-                        rec["orig_localized"] = orig_localized
-                    ai.set_name(g.appid, zh)
-                    changed_ids.append(g.appid)
-                except Exception as exc:
-                    result.warnings.append(f"{g.appid} {g.name}: {exc}")
-            if changed_ids:
-                data = ai.build()
-                appinfo_path = snapshot.info.appinfo_path
-                assert appinfo_path is not None
-                tmp = appinfo_path.with_name(appinfo_path.name + ".tmp")
-                appinfo_path.parent.mkdir(parents=True, exist_ok=True)
-
-                def write_appinfo() -> None:
-                    with open(tmp, "wb") as f:
-                        f.write(data)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp, appinfo_path)
-
-                _retry_write(write_appinfo)
-                _verify_cache_written(snapshot, changed_ids, names)
-                if lock_appinfo:
-                    _set_readonly(appinfo_path, True)
+                result.locked_shards = lock_written_shards(snapshot, changed_ids, state)
 
         result.names_applied = len(changed_ids)
         if log:
@@ -445,65 +569,170 @@ def apply_changes(
         steamenv.start_steam(env)
         result.steam_restarted = True
         if log:
-            log("已启动 Steam，等待库加载后校验 ...")
-
-        # New Steam can migrate the old monolithic appinfo.vdf to shards on
-        # startup.  A write made to the monolithic file is then discarded.
-        # Wait for the migration and apply the same names to the authoritative
-        # shard cache once it appears.
-        if need_appinfo and cache_info.kind == cache.CacheKind.MONOLITHIC:
-            if log:
-                log("检测到单文件 appinfo：等待 Steam 迁移到分片缓存 ...")
-            migrated = None
-            deadline = time.time() + 60.0
-            while time.time() < deadline:
-                time.sleep(2.0)
-                cand = cache.AppInfoCache.detect(env, wait=0.0)
-                if cand.kind == cache.CacheKind.SHARDS:
-                    migrated = cand
-                    break
-            if migrated is None:
-                result.cache_migration_timeout = True
-                result.cache_missing_after_restart = True
-                result.warnings.append(
-                    "Steam 未在预期时间内生成分片缓存；本次名称可能未持久化。"
-                )
-                if log:
-                    log("等待分片缓存超时；请退出 Steam 后重新应用")
-            else:
-                try:
-                    if log:
-                        log("分片缓存已出现，正在关闭 Steam 后写入分片 ...")
-                    steamenv.close_steam(env, log=log)
-                    time.sleep(2.0)
-                    fresh = cache.AppInfoCache.detect(env, wait=10.0)
-                    fresh.require(env.root)
-                    if fresh.kind != cache.CacheKind.SHARDS:
-                        raise RuntimeError("分片缓存消失")
-                    ss2 = fresh.load_shards()
-                    migrated_ids = []
-                    for g in planned:
-                        zh = names[g.appid]
-                        current = ss2.get_name(g.appid) or ""
-                        localized = ss2.get_localized(g.appid)
-                        if current == zh and not localized:
-                            continue
-                        ss2.set_name(g.appid, zh)
-                        migrated_ids.append(g.appid)
-                    if migrated_ids:
-                        _retry_write(ss2.save)
-                    if log:
-                        log(f"分片缓存写入完成：{len(migrated_ids)} 个名称")
-                    steamenv.start_steam(env)
-                    result.steam_restarted = True
-                    if migrated_ids:
-                        result.names_applied = max(result.names_applied, len(migrated_ids))
-                except Exception as exc:
-                    result.warnings.append(f"分片迁移后写入失败：{exc}")
-                    if log:
-                        log(f"分片迁移后写入失败：{exc}")
+            log("已启动 Steam，正在核对名称是否落盘 ...")
+        if need_appinfo and names:
+            _reconcile_after_restart(
+                env, state, names, result, log,
+                restart=restart, written_kind=cache_info.kind,
+                backup_dir=result.backup,
+            )
 
     return result
+
+
+def _wait_for_cache(
+    env: steamenv.SteamEnv,
+    log: Callable[[str], None] | None,
+    budget: float,
+) -> "cache.CacheNames | None":
+    """Wait until Steam has a readable appinfo cache again, logging progress."""
+    started = time.time()
+    last_note = 0.0
+    while time.time() - started < budget:
+        info = cache.AppInfoCache.detect(env, wait=0.0)
+        if info.exists:
+            try:
+                return info.load_names()
+            except Exception as exc:
+                if log:
+                    log(f"读取 appinfo 缓存失败，继续等待：{exc}")
+        if log and time.time() - last_note >= 15:
+            last_note = time.time()
+            log(f"Steam 正在迁移/重建 appinfo 缓存，已等待 {int(time.time() - started)} 秒 ...")
+        time.sleep(2.0)
+    return None
+
+
+def _force_rmtree(path: Path) -> None:
+    """Remove a directory that may contain read-only files (locked shards)."""
+    if not path.exists():
+        return
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                _set_readonly(Path(root) / name, False)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _restore_cache_from_backup(env: steamenv.SteamEnv, backup_dir: Path | None) -> bool:
+    """Put the pre-apply cache back when Steam deleted it while exiting."""
+    if backup_dir is None or not Path(backup_dir).is_dir():
+        return False
+    backup_dir = Path(backup_dir)
+    shard_backup = backup_dir / "appinfo"
+    if shard_backup.is_dir():
+        _force_rmtree(env.shard_dir)
+        shutil.copytree(shard_backup, env.shard_dir)
+        unlock_all_shards(env.shard_dir)
+        return True
+    for candidate in (backup_dir / "appcache" / "appinfo.vdf", backup_dir / "appinfo.vdf"):
+        if candidate.is_file():
+            _copy(candidate, env.appinfo)
+            return True
+    return False
+
+
+def _reconcile_after_restart(
+    env: steamenv.SteamEnv,
+    state: State,
+    names: dict[int, str],
+    result: ApplyResult,
+    log: Callable[[str], None] | None,
+    *,
+    restart: bool,
+    written_kind: cache.CacheKind | None = None,
+    backup_dir: Path | None = None,
+    budget: float = 240.0,
+    confirm_wait: float = 5.0,
+) -> None:
+    """After Steam starts, check the final cache and repair what Steam dropped.
+
+    Steam may migrate a monolithic ``appinfo.vdf`` to shards, may rebuild a
+    deleted cache, and may replace app records with fresh copies downloaded
+    from Steam's CDN.  Instead of guessing at timers we wait for the cache to
+    settle, compare every planned name, and only then report a result.
+    """
+    view = _wait_for_cache(env, log, budget)
+    if view is None:
+        result.cache_missing_after_restart = True
+        result.warnings.append(
+            "Steam 尚未重建 appinfo 缓存，暂时无法核对名称；稍后可用“检查名称覆盖”补写。"
+        )
+        if log:
+            log("Steam 在预期时间内没有重建 appinfo 缓存；稍后可用“检查名称覆盖”补写名称")
+        return
+
+    # Steam writes shards progressively, then downloads deltas a bit later.
+    time.sleep(3.0)
+    diff = cache.compare_names(view, names)
+    if diff.ok:
+        time.sleep(confirm_wait)
+        try:
+            again = cache.AppInfoCache.detect(env, wait=0.0).load_names()
+        except Exception:
+            again = None
+        if again is not None:
+            second = cache.compare_names(again, names)
+            if second.ok:
+                result.cache_ready = True
+                if log:
+                    log(f"名称核对完成：{len(names)} 个中文名全部生效")
+                return
+            view, diff = again, second
+        else:
+            result.cache_ready = True
+            if log:
+                log(f"名称核对完成：{len(names)} 个中文名全部生效")
+            return
+
+    if written_kind is not None and written_kind != view.kind:
+        result.cache_rebuilt = True
+    if log:
+        log(
+            f"Steam 已替换 {len(diff.drifted)} 个游戏的元数据，"
+            f"正在把中文名补写回 {view.kind.value} 缓存 ..."
+        )
+    try:
+        if steamenv.steam_running():
+            steamenv.close_steam(env, log=log)
+            time.sleep(1.5)
+        fresh_info = cache.AppInfoCache.detect(env, wait=30.0)
+        if not fresh_info.exists:
+            if _restore_cache_from_backup(env, backup_dir):
+                if log:
+                    log("Steam 退出时删除了缓存，已从本次备份恢复")
+            fresh_info = cache.AppInfoCache.detect(env, wait=30.0)
+        fresh_info.require(env.root)
+        fresh = fresh_info.load_names()
+        repair_names = {
+            appid: want
+            for appid, want in names.items()
+            if appid not in diff.missing and (fresh.get(appid) or "") != want
+        }
+        changed = write_names(fresh, repair_names, state=state)
+        if changed:
+            save_names(fresh)
+            check = cache.compare_names(fresh_info.load_names(), repair_names)
+            if not check.ok:
+                raise ApplyError(
+                    "补写后仍有 %d 个名称未生效" % check.count
+                )
+        result.cache_ready = True
+        if fresh.kind != view.kind:
+            result.cache_rebuilt = True
+        result.repaired = len(changed)
+        if log:
+            log(f"已把 {len(changed)} 个中文名补写到 {fresh.kind.value} 缓存")
+        if restart:
+            steamenv.start_steam(env)
+            result.steam_restarted = True
+    except Exception as exc:
+        result.drifted = list(diff.drifted)
+        result.warnings.append(f"补写名称失败：{exc}")
+        if log:
+            log(f"补写名称失败：{exc}")
 
 
 def verify(
@@ -526,8 +755,10 @@ def verify(
     else:
         cache_info = cache.AppInfoCache.detect(env, wait=0.0)
         deadline = time.time() + 45.0
+        noted = False
         while cache_info.kind == cache.CacheKind.MISSING and time.time() < deadline:
-            if log:
+            if log and not noted:
+                noted = True
                 log("Steam 正在重建 appinfo 缓存，等待缓存出现 ...")
             time.sleep(2.0)
             cache_info = cache.AppInfoCache.detect(env, wait=0.0)
@@ -541,22 +772,15 @@ def verify(
             log(cache.diagnostic(env))
         return result
     if mode != "categories":
-        ss = cache_info.load_shards() if cache_info.kind == cache.CacheKind.SHARDS else None
-        ai = cache_info.load_appinfo() if cache_info.kind == cache.CacheKind.MONOLITHIC else None
+        expected = names_from_state(state, {g.appid for g in games})
+        view = cache_info.load_names()
+        diff = cache.compare_names(view, expected)
+        result.drifted = list(diff.drifted)
+        result.verify_failed = list(diff.drifted)
+        result.verified_names = len(expected) - len(diff.drifted) - len(diff.missing)
         installed = steamenv.installed_apps(env.root)
-        for g in games:
-            rec = state.get_app(g.appid)
-            if rec.get("skipped"):
-                continue
-            zh = str(rec.get("zh_name") or "").strip()
-            if not zh:
-                continue
-            current = (ss.get_name(g.appid) if ss else ai.get_name(g.appid)) or ""
-            if current == zh:
-                result.verified_names += 1
-            else:
-                result.verify_failed.append(g.appid)
-            info = installed.get(g.appid)
+        for appid, zh in expected.items():
+            info = installed.get(appid)
             acf = info.get("acf") if info else None
             if isinstance(acf, Path) and acf.is_file():
                 try:
@@ -567,6 +791,40 @@ def verify(
                     pass
     result.collections_verified = True
     return result
+
+
+def describe_result(res: ApplyResult, mode: str = "both") -> str:
+    """Human-readable, truthful summary shared by the GUI, CLI and logs."""
+    lines: list[str] = []
+    if mode != "categories":
+        if res.names_applied:
+            lines.append(f"已写入中文名 {res.names_applied} 个。")
+        elif res.names_expected:
+            lines.append("appinfo 中已是最新，无需改写名称。")
+        else:
+            lines.append("没有可写入的中文名。")
+    if mode != "names":
+        lines.append(f"已更新收藏集 {res.collections_changed} 个。")
+    if mode != "categories" and res.names_expected:
+        if res.cache_ready:
+            lines.append(f"重启后核对：{res.names_expected} 个名称全部生效。")
+        elif res.repaired:
+            lines.append(f"Steam 重建缓存后已补写 {res.repaired} 个名称。")
+        elif res.cache_missing_after_restart:
+            lines.append("Steam 尚未重建 appinfo 缓存，稍后可用“检查名称覆盖”补写。")
+        elif res.drifted:
+            lines.append(
+                f"其中 {len(res.drifted)} 个名称已被 Steam 重新下载覆盖"
+                "（Steam 会定期更新元数据，属正常现象）。"
+            )
+        else:
+            lines.append("名称已写入，Steam 下次启动时生效。")
+    if res.locked_shards:
+        lines.append(f"已把 {res.locked_shards} 个 appinfo 文件设为只读，防止 Steam 覆盖。")
+    if res.warnings:
+        lines.append("提示：")
+        lines.extend(res.warnings[:8])
+    return "\n".join(lines)
 
 def _find_backup_file(backup_dir: Path, env: steamenv.SteamEnv, name: str, subdirs: list[str]) -> Path | None:
     candidates = [backup_dir / name]
@@ -587,6 +845,8 @@ def _restore_files(
 ) -> int:
     if not env.has_shards and is_readonly(env.appinfo):
         _set_readonly(env.appinfo, False)
+    unlock_all_shards(env.shard_dir)
+    state.data["locked_shards"] = []
     restored = 0
     shard_backup = backup_dir / "appinfo"
     if shard_backup.is_dir():
@@ -595,6 +855,7 @@ def _restore_files(
         if env.shard_dir.exists():
             shutil.rmtree(env.shard_dir)
         shutil.copytree(shard_backup, env.shard_dir)
+        unlock_all_shards(env.shard_dir)
         restored += len(list(env.shard_dir.glob("appinfo_*.vdf")))
     else:
         appinfo_candidates = [
@@ -684,6 +945,10 @@ def restore_backup(
     count = _restore_files(env, state, backup_dir, restore_state=True)
     if log:
         log(f"已从 {backup_dir} 还原 {count} 个文件")
+        log(
+            "提示：还原的是旧缓存，Steam 会重新下载全量元数据，"
+            "名称可能再次被覆盖；建议随后用“检查名称覆盖”回写。"
+        )
     if restart:
         steamenv.start_steam(env)
 

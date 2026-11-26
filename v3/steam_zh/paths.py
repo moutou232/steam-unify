@@ -44,10 +44,20 @@ def _writable_dir(path: Path) -> bool:
 
 
 def data_dir() -> Path:
-    """Writable data directory next to the exe, with a LocalAppData fallback."""
+    """Writable data directory next to the exe, with a LocalAppData fallback.
+
+    ``STEAM_UNIFY_DATA_DIR`` overrides the location; it exists so tests and
+    diagnostics can run against a throw-away copy without touching user data.
+    """
     global _DATA_DIR
     if _DATA_DIR is not None:
         return _DATA_DIR
+    override = os.environ.get("STEAM_UNIFY_DATA_DIR", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        _DATA_DIR = path
+        return path
     primary = app_dir() / "data"
     if _writable_dir(primary):
         _DATA_DIR = primary

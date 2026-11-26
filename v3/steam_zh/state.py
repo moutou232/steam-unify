@@ -15,7 +15,11 @@ DATA_DIR = paths.data_dir()
 STATE_PATH = DATA_DIR / "state.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 
-APP_VERSION = "3.1.2"
+APP_VERSION = "3.1.4"
+
+# Bumped whenever a settings default changes in a way that must reach existing
+# installs once.  Users who toggle the value afterwards keep their choice.
+SETTINGS_REV = 4
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -28,7 +32,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "include_software": False,
     "all_known": True,
     "restart_steam": True,
-    "lock_appinfo": False,
+    "lock_appinfo": True,
+    "auto_repair_names": True,
+    "first_run_done": False,
+    "settings_rev": SETTINGS_REV,
     "backup_keep": 10,
     "window_mode": "maximized",
     "window_geometry": "",
@@ -83,6 +90,8 @@ class State:
         self.data.setdefault("collection_ids", {})
         self.data.setdefault("collection_owned", {})
         self.data.setdefault("settings", {})
+        if not isinstance(self.data.get("locked_shards"), list):
+            self.data["locked_shards"] = []
         self._normalize_collections()
         for key, value in DEFAULT_SETTINGS.items():
             self.data["settings"].setdefault(key, value)
@@ -244,7 +253,24 @@ class State:
         # must never be overwritten.
         if raw.get("source_priority") == OLD_SOURCE_PRIORITY:
             data["source_priority"] = list(DEFAULT_SETTINGS["source_priority"])
+        _migrate_settings(data, raw)
         return data
+
+
+def _migrate_settings(data: dict[str, Any], raw: dict[str, Any]) -> None:
+    """Apply one-off default changes to an existing settings dict.
+
+    ``settings_rev`` acts as a watermark: the migration runs once, then the
+    stored values (including an explicit "off") win forever.
+    """
+    try:
+        rev = int(raw.get("settings_rev") or 0)
+    except (TypeError, ValueError):
+        rev = 0
+    if rev < SETTINGS_REV:
+        # v3.1.4: the appinfo read-only lock became the recommended default.
+        data["lock_appinfo"] = True
+    data["settings_rev"] = SETTINGS_REV
 
 
 def now_ts() -> int:
